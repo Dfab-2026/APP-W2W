@@ -54,35 +54,6 @@ async function upsertRoleProfileCompatible(admin, table, userId, payload) {
   return { data: null, error: new Error(`Unable to save ${table} profile after compatibility retries`) };
 }
 
-// Production-safe verification persistence. The UI must not move to Pending unless
-// the role row actually contains the submitted status. This also protects against
-// schema-cache/compatibility retries silently dropping one of the workflow fields.
-async function ensureVerificationSubmissionPersisted(admin, table, userId, section) {
-  const normalizedSection = normalizeVerifySectionName(section || 'profile');
-  const required = {
-    verification_status: 'pending',
-    verification_section: normalizedSection,
-    verification_notes: null,
-    verified: false,
-    verification_submitted_at: new Date().toISOString(),
-  };
-
-  const first = await upsertRoleProfileCompatible(admin, table, userId, required);
-  if (first.error) return first;
-  const { data: row, error: readError } = await admin
-    .from(table)
-    .select('*')
-    .eq('user_id', userId)
-    .maybeSingle();
-  if (readError) return { data: null, error: readError };
-  const savedStatus = String(row?.verification_status || '').toLowerCase();
-  const savedSection = normalizeVerifySectionName(row?.verification_section || '');
-  if (!['pending', 'submitted'].includes(savedStatus) || savedSection !== normalizedSection) {
-    return { data: row, error: new Error('Verification status was not persisted. Please retry.') };
-  }
-  return { data: row, error: null };
-}
-
 function normalizeVerifySectionName(section) {
   return section === 'verification' ? 'documents' : section;
 }
@@ -1511,11 +1482,6 @@ async function route(request, { params }) {
           const result = await upsertRoleProfileCompatible(admin, 'workers', me.id, wu);
           if (result.error) return err(result.error.message, 400);
           updatedExtra = result.data;
-          if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
-            const persisted = await ensureVerificationSubmissionPersisted(admin, 'workers', me.id, wu.verification_section || body.verification_section || 'profile');
-            if (persisted.error) return err(persisted.error.message, 400);
-            updatedExtra = persisted.data;
-          }
         }
       } else if (role === 'employer') {
         const ef = ['company_name', 'company_logo', 'industry', 'company_size', 'hr_contact', 'official_email', 'location_text',
@@ -1546,11 +1512,6 @@ async function route(request, { params }) {
           const result = await upsertRoleProfileCompatible(admin, 'employers', me.id, eu);
           if (result.error) return err(result.error.message, 400);
           updatedExtra = result.data;
-          if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
-            const persisted = await ensureVerificationSubmissionPersisted(admin, 'employers', me.id, eu.verification_section || body.verification_section || 'profile');
-            if (persisted.error) return err(persisted.error.message, 400);
-            updatedExtra = persisted.data;
-          }
         }
       }
 

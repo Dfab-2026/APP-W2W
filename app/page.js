@@ -1702,12 +1702,12 @@ function AdminApp({ auth, onLogout }) {
   });
 
   return (
-    <div className="h-[100dvh] overflow-y-auto overflow-x-hidden bg-slate-100 text-slate-950">
-      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white/95 backdrop-blur-xl shadow-sm">
+    <div className="h-[100dvh] overflow-y-auto overflow-x-hidden bg-[radial-gradient(circle_at_top_left,_#dbeafe_0,_#f8fafc_34%,_#eef2ff_72%,_#f8fafc_100%)] text-slate-950">
+      <header className="sticky top-0 z-30 border-b border-white/60 bg-slate-950/95 text-white backdrop-blur-2xl shadow-2xl shadow-slate-950/20">
         <div className="container py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
-            <p className="text-xs font-bold text-blue-600 uppercase tracking-[0.18em]">Work2Wish Administration</p>
-            <h1 className="text-2xl font-extrabold flex items-center gap-3 mt-1 text-slate-950">
+            <p className="text-xs font-bold text-sky-300 uppercase tracking-[0.18em]">Work2Wish Administration</p>
+            <h1 className="text-2xl font-extrabold flex items-center gap-3 mt-1 text-white">
               <motion.div
                 className="w-10 h-10 rounded-xl bg-blue-600 grid place-items-center text-white shadow-sm"
                 animate={{ scale: [1, 1.03, 1] }}
@@ -1717,11 +1717,11 @@ function AdminApp({ auth, onLogout }) {
               </motion.div>
               Admin Dashboard
             </h1>
-            <p className="text-sm text-slate-500 mt-1">Manage users, verification requests, maintenance and account safety.</p>
+            <p className="text-sm text-slate-300 mt-1">Manage users, verification requests, maintenance and account safety.</p>
           </div>
           <div className="flex gap-2 items-center">
             <NotificationCenter token={token} userId={auth?.profile?.id} channelKey="admin" accent="amber" />
-            <Button variant="outline" onClick={loadUsers} disabled={busy} className="border-slate-200 bg-white text-slate-700 hover:bg-slate-50">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
+            <Button variant="outline" onClick={loadUsers} disabled={busy} className="border-white/20 bg-white/10 text-white hover:bg-white/20">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
             <Button onClick={onLogout} className="bg-slate-900 text-white hover:bg-slate-800 shadow-sm"><LogOut className="w-4 h-4 mr-2" /> Logout</Button>
           </div>
         </div>
@@ -1737,13 +1737,13 @@ function AdminApp({ auth, onLogout }) {
             ['Verified', adminStats.verified, 'text-emerald-600'],
             ['Blocked', adminStats.blocked, 'text-red-600'],
           ].map(([label, value, color]) => (
-            <motion.div key={label} whileHover={{ y: -2 }} transition={{ duration: 0.18 }}><Card className="border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow"><CardContent className="p-5"><p className="text-[11px] font-bold uppercase tracking-[0.12em] text-slate-500">{label}</p><p className={`mt-2 text-3xl font-extrabold ${color}`}>{value}</p></CardContent></Card></motion.div>
+            <motion.div key={label} whileHover={{ y: -2 }} transition={{ duration: 0.18 }}><Card className="overflow-hidden border border-white/70 bg-white/85 shadow-xl shadow-slate-200/70 backdrop-blur-xl hover:-translate-y-1 hover:shadow-2xl transition-all"><CardContent className="relative p-5"><p className="text-[11px] font-bold uppercase tracking-[0.12em] text-slate-500">{label}</p><p className={`mt-2 text-3xl font-extrabold ${color}`}>{value}</p></CardContent></Card></motion.div>
           ))}
         </div>
 
-        <Card className="border border-slate-200 bg-white shadow-sm">
+        <Card className="border border-white/70 bg-white/85 shadow-xl shadow-slate-200/60 backdrop-blur-xl">
           <CardContent className="p-3">
-            <div className="grid sm:grid-cols-4 gap-2 rounded-xl bg-slate-100 p-1.5">
+            <div className="grid sm:grid-cols-4 gap-2 rounded-2xl bg-slate-100/90 p-1.5">
               {[
                 ['users', 'Users & Verification'],
                 ['maintenance', 'Update Mode'],
@@ -1798,7 +1798,7 @@ function AdminApp({ auth, onLogout }) {
           <Card className="border-red-200 bg-red-50/70"><CardContent className="p-4 text-sm text-red-800">Block, unblock and delete controls are available in the user table and user details popup. Admin accounts are protected from these actions.</CardContent></Card>
         )}
 
-        {adminTab === 'users' && <Card className="border border-slate-200 bg-white shadow-sm">
+        {adminTab === 'users' && <Card className="overflow-hidden border border-white/80 bg-white/90 shadow-2xl shadow-slate-200/70 backdrop-blur-xl">
           <CardHeader className="space-y-3">
             <div className="flex flex-col gap-3">
               <div>
@@ -1913,6 +1913,7 @@ function AdminApp({ auth, onLogout }) {
                       title="Profile"
                       tone="indigo"
                       icon={<UserCircle className="w-4 h-4" />}
+                      status={getAdminSectionState('profile')}
                       verified={isSectionVerified('profile')}
                       onVerify={() => verifySection('profile')}
                       disabled={busy || selected.role === 'admin'}
@@ -1933,6 +1934,7 @@ function AdminApp({ auth, onLogout }) {
                         title="Bank Details"
                         tone="emerald"
                         icon={<Banknote className="w-4 h-4" />}
+                        status={getAdminSectionState('bank')}
                         verified={isSectionVerified('bank')}
                         onVerify={() => verifySection('bank')}
                         disabled={busy || selected.role === 'admin'}
@@ -1951,6 +1953,7 @@ function AdminApp({ auth, onLogout }) {
                       title={verificationTitle}
                       tone="amber"
                       icon={<ShieldCheck className="w-4 h-4" />}
+                      status={getAdminSectionState('verification')}
                       verified={isSectionVerified('verification')}
                       onVerify={() => verifySection('verification')}
                       disabled={busy || selected.role === 'admin'}
@@ -2066,31 +2069,38 @@ function AdminApp({ auth, onLogout }) {
   );
 }
 
-function AdminVerificationSection({ title, tone = 'indigo', icon, verified, children, onVerify, disabled }) {
-  const styles = {
-    indigo: 'border-indigo-200 bg-indigo-50/60 text-indigo-800',
-    emerald: 'border-emerald-200 bg-emerald-50/60 text-emerald-800',
-    amber: 'border-amber-200 bg-amber-50/60 text-amber-800',
-  };
-  const button = verified
-    ? 'w2w-verify-button w2w-verify-done border-emerald-600 bg-emerald-600 text-white hover:border-emerald-700 hover:bg-emerald-700 disabled:!opacity-100 disabled:bg-emerald-600 disabled:text-white disabled:cursor-default'
-    : 'w2w-verify-button w2w-verify-idle border-rose-600 bg-rose-600 text-white hover:border-rose-700 hover:bg-rose-700';
-  const buttonStyle = verified
-    ? { backgroundColor: '#16a34a', color: '#ffffff', borderColor: '#16a34a' }
-    : { backgroundColor: '#dc2626', color: '#ffffff', borderColor: '#dc2626' };
+function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_submitted', verified, children, onVerify, disabled }) {
+  const normalizedStatus = verified ? 'verified' : normalizeVerifyStatusValue(status) || 'not_submitted';
+  const palette = {
+    indigo: { shell: 'border-indigo-200/80 bg-gradient-to-br from-white via-indigo-50/50 to-blue-50/70', icon: 'bg-indigo-600', ring: 'shadow-indigo-100' },
+    emerald: { shell: 'border-emerald-200/80 bg-gradient-to-br from-white via-emerald-50/50 to-teal-50/70', icon: 'bg-emerald-600', ring: 'shadow-emerald-100' },
+    amber: { shell: 'border-amber-200/80 bg-gradient-to-br from-white via-amber-50/50 to-orange-50/70', icon: 'bg-amber-500', ring: 'shadow-amber-100' },
+  }[tone] || { shell: 'border-indigo-200/80 bg-white', icon: 'bg-indigo-600', ring: 'shadow-indigo-100' };
+  const meta = normalizedStatus === 'verified'
+    ? { label: 'Verified', badge: 'border-emerald-200 bg-emerald-50 text-emerald-700', button: 'bg-emerald-600 hover:bg-emerald-700', buttonLabel: 'Done', ButtonIcon: CheckCircle2 }
+    : normalizedStatus === 'pending'
+      ? { label: 'Awaiting review', badge: 'border-amber-200 bg-amber-50 text-amber-700', button: 'bg-amber-500 hover:bg-amber-600', buttonLabel: 'Approve section', ButtonIcon: Clock }
+      : normalizedStatus === 'rejected'
+        ? { label: 'Needs correction', badge: 'border-rose-200 bg-rose-50 text-rose-700', button: 'bg-rose-600 hover:bg-rose-700', buttonLabel: 'Verify after correction', ButtonIcon: XCircle }
+        : { label: 'Not submitted', badge: 'border-slate-200 bg-slate-50 text-slate-600', button: 'bg-slate-900 hover:bg-slate-800', buttonLabel: 'Verify section', ButtonIcon: ShieldCheck };
+  const ActionIcon = meta.ButtonIcon;
   return (
-    <motion.div whileHover={{ y: -3 }} transition={{ type: 'spring', stiffness: 260, damping: 22 }} className={`rounded-3xl border ${styles[tone] || styles.indigo} p-5 shadow-xl shadow-slate-950/5 backdrop-blur-sm`}>
-      <div className="flex items-start justify-between gap-3 mb-4">
-        <div>
-          <h3 className="font-extrabold flex items-center gap-2">{icon}{title}</h3>
-          <Badge className={verified ? 'mt-2 bg-emerald-100 text-emerald-800 border border-emerald-200' : 'mt-2 bg-white text-slate-600 border border-slate-200'}>{verified ? 'Section verified' : 'Review pending'}</Badge>
+    <motion.section whileHover={{ y: -4 }} transition={{ type: 'spring', stiffness: 260, damping: 24 }} className={`relative overflow-hidden rounded-[28px] border ${palette.shell} p-5 shadow-xl ${palette.ring}`}>
+      <div className="absolute -right-12 -top-12 h-32 w-32 rounded-full bg-white/60 blur-2xl" />
+      <div className="relative flex items-start justify-between gap-3 mb-5">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className={`grid h-11 w-11 shrink-0 place-items-center rounded-2xl ${palette.icon} text-white shadow-lg`}>{icon}</div>
+          <div className="min-w-0">
+            <h3 className="font-black text-slate-950 leading-tight">{title}</h3>
+            <Badge className={`mt-2 border px-2.5 py-1 font-bold ${meta.badge}`}>{meta.label}</Badge>
+          </div>
         </div>
-        <Button size="sm" variant="outline" disabled={disabled || verified} onClick={onVerify} className={button} style={buttonStyle}>
-          <CheckCircle2 className="w-4 h-4 mr-1" /> {verified ? 'Done' : 'Verify'}
+        <Button size="sm" disabled={disabled || normalizedStatus === 'verified'} onClick={onVerify} className={`${meta.button} min-w-[132px] rounded-xl text-white shadow-md disabled:!opacity-100`}>
+          <ActionIcon className="w-4 h-4 mr-1.5" /> {meta.buttonLabel}
         </Button>
       </div>
-      <div className="space-y-3">{children}</div>
-    </motion.div>
+      <div className="relative space-y-3">{children}</div>
+    </motion.section>
   );
 }
 
@@ -5703,17 +5713,11 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
             verification_section: 'documents',
           };
 
-      const saved = await api('me/profile', { method: 'PATCH', token, body });
-      const persistedExtra = saved?.extra || {};
-      const persistedStatus = String(persistedExtra.verification_status || body.verification_status || '').toLowerCase();
-      const persistedSection = normalizeVerifySectionName(persistedExtra.verification_section || body.verification_section || 'documents');
-      if (!['pending', 'submitted'].includes(persistedStatus) || persistedSection !== 'documents') {
-        throw new Error('Verification was not saved. Please retry.');
-      }
-      setForm((s) => ({ ...s, ...body, ...persistedExtra, verification_status: 'pending', verification_section: 'documents' }));
+      await api('me/profile', { method: 'PATCH', token, body });
+      setForm((s) => ({ ...s, ...body }));
       setLocalDocumentEdited(false);
       toast.success('Verification submitted for admin review');
-      await onSaved?.();
+      onSaved?.();
     } catch (e) {
       toast.error(e.message || 'Unable to submit verification');
     } finally {
@@ -6189,22 +6193,27 @@ function SectionVerificationAction({ token, me, section, title, description, col
   const [busy, setBusy] = useState(false);
   const verified = !!me?.extra?.verified;
   const rawStatus = sectionReviewState(me, section, me?.extra?.verification_status, verified);
+  const pendingStorageKey = `w2w-verification-pending-${me?.profile?.id || me?.id || 'me'}-${normalizeVerifySectionName(section)}`;
   const [localStatus, setLocalStatus] = useState(rawStatus);
-  const [submittedLocally, setSubmittedLocally] = useState(false);
+  const [submittedLocally, setSubmittedLocally] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return sessionStorage.getItem(pendingStorageKey) === '1';
+  });
   useEffect(() => {
     setLocalStatus((previous) => {
-      // Do not briefly downgrade an optimistic Pending state while the refreshed
-      // profile response is still catching up with the successful PATCH.
+      // Keep the submitted card yellow while production profile data catches up.
       if (submittedLocally && previous === 'pending' && rawStatus === 'not_submitted') return previous;
       return rawStatus;
     });
     if (rawStatus === 'pending' || rawStatus === 'verified' || rawStatus === 'rejected') {
       setSubmittedLocally(false);
+      try { sessionStorage.removeItem(pendingStorageKey); } catch {}
     }
-  }, [rawStatus, section, submittedLocally]);
+  }, [rawStatus, section, submittedLocally, pendingStorageKey]);
   useEffect(() => {
-    setSubmittedLocally(false);
-  }, [section]);
+    const persistedPending = typeof window !== 'undefined' && sessionStorage.getItem(pendingStorageKey) === '1';
+    setSubmittedLocally(persistedPending);
+  }, [section, pendingStorageKey]);
   // A successful submit must override the stale `modified` comparison until the
   // parent profile state receives the saved database values. This makes the
   // button turn yellow immediately without a refresh.
@@ -6251,6 +6260,7 @@ function SectionVerificationAction({ token, me, section, title, description, col
       // Keep this optimistic state until refreshed profile data confirms it.
       setLocalStatus('pending');
       setSubmittedLocally(true);
+      try { sessionStorage.setItem(pendingStorageKey, '1'); } catch {}
       setForm?.((prev) => ({ ...prev, ...body, verification_status: 'pending', verification_section: normalizedSection }));
       await onSaved?.();
       toast.success(`${title} sent for admin verification`);
@@ -6475,7 +6485,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
   const workerBankCardVerifiedForSave = workerBankReviewStatus === 'verified' && !workerBankChangedAfterReview;
   const workerAllProfileCardsVerified = workerProfileCardVerifiedForSave && workerDocumentCardVerifiedForSave && workerBankCardVerifiedForSave;
   const workerAnyProfileCardPending = [workerProfileReviewStatus, workerDocumentReviewStatus, workerBankReviewStatus].some((s) => s === 'pending') && !(workerProfileChangedAfterReview || workerDocumentChangedAfterReview || workerBankChangedAfterReview);
-  const workerTopStatus = workerAllProfileCardsVerified ? (finalSaved ? 'verified' : 'unverified') : workerAnyProfileCardPending ? 'pending' : 'unverified';
+  const workerTopStatus = workerAllProfileCardsVerified ? 'verified' : workerAnyProfileCardPending ? 'pending' : 'unverified';
 
   useEffect(() => {
     if (!workerAllProfileCardsVerified && finalSaved) {
