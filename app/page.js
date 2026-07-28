@@ -5703,11 +5703,17 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
             verification_section: 'documents',
           };
 
-      await api('me/profile', { method: 'PATCH', token, body });
-      setForm((s) => ({ ...s, ...body }));
+      const saved = await api('me/profile', { method: 'PATCH', token, body });
+      const persistedExtra = saved?.extra || {};
+      const persistedStatus = String(persistedExtra.verification_status || body.verification_status || '').toLowerCase();
+      const persistedSection = normalizeVerifySectionName(persistedExtra.verification_section || body.verification_section || 'documents');
+      if (!['pending', 'submitted'].includes(persistedStatus) || persistedSection !== 'documents') {
+        throw new Error('Verification was not saved. Please retry.');
+      }
+      setForm((s) => ({ ...s, ...body, ...persistedExtra, verification_status: 'pending', verification_section: 'documents' }));
       setLocalDocumentEdited(false);
       toast.success('Verification submitted for admin review');
-      onSaved?.();
+      await onSaved?.();
     } catch (e) {
       toast.error(e.message || 'Unable to submit verification');
     } finally {
