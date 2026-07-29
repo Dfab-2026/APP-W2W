@@ -3444,7 +3444,7 @@ function WorkerApp({ auth, onLogout }) {
   useEffect(() => { if (token) { refreshMe(); } }, [token]);
   useEffect(() => {
     if (!token || tab !== 'profile') return undefined;
-    const timer = setInterval(() => refreshMe({ silent: true }), 4000);
+    const timer = setInterval(() => refreshMe({ silent: true }), 2000);
     return () => clearInterval(timer);
   }, [token, tab]);
 
@@ -5802,37 +5802,53 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
       }
     }
 
-    setBusy(true);
-    try {
-      const body = isEmployer
-        ? {
-            pan_image_url: form.pan_image_url,
-            pan_back_url: form.pan_back_url,
-            gst_certificate_url: form.gst_certificate_url,
-            verification_status: 'pending',
-            verification_section: 'documents',
-          }
-        : {
-            address: form.address,
-            aadhaar_number: cleanAadhaar(form.aadhaar_number),
-            pan_number: pan,
-            aadhaar_front_url: form.aadhaar_front_url,
-            aadhaar_back_url: form.aadhaar_back_url,
-            pan_image_url: form.pan_image_url,
-            pan_back_url: form.pan_back_url,
-            certificate_url: form.certificate_url,
-            verification_status: 'pending',
-            verification_section: 'documents',
-          };
+    const body = isEmployer
+      ? {
+          pan_image_url: form.pan_image_url,
+          pan_back_url: form.pan_back_url,
+          gst_certificate_url: form.gst_certificate_url,
+          verification_status: 'pending',
+          verification_section: 'documents',
+        }
+      : {
+          address: form.address,
+          aadhaar_number: cleanAadhaar(form.aadhaar_number),
+          pan_number: pan,
+          aadhaar_front_url: form.aadhaar_front_url,
+          aadhaar_back_url: form.aadhaar_back_url,
+          pan_image_url: form.pan_image_url,
+          pan_back_url: form.pan_back_url,
+          certificate_url: form.certificate_url,
+          verification_status: 'pending',
+          verification_section: 'documents',
+        };
+    const previousLocalDocumentEdited = localDocumentEdited;
+    const previousLocalReviewStatus = localReviewStatus;
+    const previousVerificationStatus = form.verification_status;
+    const previousVerificationSection = form.verification_section;
+    const rollbackStatus = previousLocalDocumentEdited || documentChangedAfterReview
+      ? 'modified'
+      : (previousLocalReviewStatus || documentReviewStatus || 'not_submitted');
 
+    // Optimistic transition: immediately show Pending Approval while the request runs.
+    setBusy(true);
+    setLocalDocumentEdited(false);
+    setLocalReviewStatus('pending');
+    onStatusChange?.('documents', 'pending');
+    setForm((s) => ({ ...s, ...body }));
+    try {
       await api('me/profile', { method: 'PATCH', token, body });
-      setForm((s) => ({ ...s, ...body }));
-      setLocalDocumentEdited(false);
-      setLocalReviewStatus('pending');
-      onStatusChange?.('documents', 'pending');
       toast.success('Verification submitted for admin review');
       onSaved?.();
     } catch (e) {
+      setLocalDocumentEdited(previousLocalDocumentEdited);
+      setLocalReviewStatus(previousLocalReviewStatus);
+      onStatusChange?.('documents', rollbackStatus);
+      setForm((s) => ({
+        ...s,
+        verification_status: previousVerificationStatus,
+        verification_section: previousVerificationSection,
+      }));
       toast.error(e.message || 'Unable to submit verification');
     } finally {
       setBusy(false);
@@ -6253,7 +6269,10 @@ function hasBankDetailsChanged(current = {}, saved = {}) {
 
 const PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'age', 'gender', 'skills', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known', 'available', 'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'previous_employer_reference', 'bio', 'resume_url'];
 const EMPLOYER_PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'company_name', 'industry', 'company_size', 'hr_contact', 'official_email', 'company_address', 'gst_number', 'pan_number', 'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'description'];
-const WORKER_DOCUMENT_VERIFY_FIELDS = ['address', 'aadhaar_number', 'pan_number', 'aadhaar_front_url', 'aadhaar_back_url', 'pan_image_url', 'pan_back_url', 'certificate_url', 'selfie_url', 'selfie_front_url', 'selfie_left_url', 'selfie_right_url'];
+// Compare only fields that belong to the Worker Verification card.
+// Selfie fields are verified by the separate Selfie card and must not keep
+// this document card red after the admin has approved its documents.
+const WORKER_DOCUMENT_VERIFY_FIELDS = ['address', 'aadhaar_number', 'pan_number', 'aadhaar_front_url', 'aadhaar_back_url', 'pan_image_url', 'pan_back_url', 'certificate_url'];
 const EMPLOYER_DOCUMENT_VERIFY_FIELDS = ['gst_number', 'pan_number', 'pan_image_url', 'pan_back_url', 'gst_certificate_url'];
 
 function normalizeVerifyValue(key, value) {
@@ -6449,20 +6468,38 @@ function SectionVerificationAction({ token, me, section, title, description, col
 
   const sendForReview = async () => {
     if (blocked || busy) return;
-    setBusy(true);
+
+    let extraPayload;
     try {
       if (validate) {
         const validationMessage = validate();
         if (validationMessage) throw new Error(validationMessage);
       }
-      const extraPayload = payloadBuilder ? (payloadBuilder() || {}) : {};
-      const normalizedSection = normalizeVerifySectionName(section);
-      const body = {
-        ...extraPayload,
-        verification_status: 'pending',
-        verification_section: normalizedSection,
-      };
+      extraPayload = payloadBuilder ? (payloadBuilder() || {}) : {};
+    } catch (e) {
+      toast.error(e.message || 'Complete the required details before verification');
+      return;
+    }
 
+    const normalizedSection = normalizeVerifySectionName(section);
+    const body = {
+      ...extraPayload,
+      verification_status: 'pending',
+      verification_section: normalizedSection,
+    };
+    const submittedFingerprint = verificationPayloadFingerprint(extraPayload);
+    const previousForcedStatus = forcedStatus;
+    const previousSubmittedPayloadFingerprint = submittedPayloadFingerprint;
+    const rollbackStatus = modified && !submittedValuesAreCurrent
+      ? 'modified'
+      : (previousForcedStatus || rawStatus || 'not_submitted');
+
+    // Optimistic transition: the clicked button becomes yellow immediately.
+    setBusy(true);
+    setSubmittedPayloadFingerprint(submittedFingerprint);
+    setForcedStatus('pending');
+    onStatusChange?.(normalizedSection, 'pending');
+    try {
       const saved = await api('me/profile', { method: 'PATCH', token, body });
       const savedSection = normalizeVerifySectionName(saved?.extra?.verification_section || normalizedSection);
       const savedStatus = normalizeVerifyStatusValue(saved?.extra?.verification_status || 'pending');
@@ -6470,11 +6507,6 @@ function SectionVerificationAction({ token, me, section, title, description, col
         throw new Error('Verification status was not saved. Please retry.');
       }
 
-      // Change only this card immediately.
-      const submittedFingerprint = verificationPayloadFingerprint(extraPayload);
-      setSubmittedPayloadFingerprint(submittedFingerprint);
-      setForcedStatus('pending');
-      onStatusChange?.(normalizedSection, 'pending');
       try {
         localStorage.setItem(pendingStorageKey, '1');
         localStorage.setItem(fallbackPendingStorageKey, '1');
@@ -6489,6 +6521,9 @@ function SectionVerificationAction({ token, me, section, title, description, col
       toast.success(`${title} sent for admin verification`);
       await onSaved?.();
     } catch (e) {
+      setForcedStatus(previousForcedStatus);
+      setSubmittedPayloadFingerprint(previousSubmittedPayloadFingerprint);
+      onStatusChange?.(normalizedSection, rollbackStatus);
       toast.error(e.message || 'Unable to send verification');
     } finally {
       setBusy(false);
@@ -6686,10 +6721,6 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
     pan_image_url: form.pan_image_url || '',
     pan_back_url: form.pan_back_url || '',
     certificate_url: form.certificate_url || '',
-    selfie_url: form.selfie_url || '',
-    selfie_front_url: form.selfie_front_url || '',
-    selfie_left_url: form.selfie_left_url || '',
-    selfie_right_url: form.selfie_right_url || '',
   });
 
   const buildWorkerBankPayload = () => ({
@@ -6743,7 +6774,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
   const workerBankCardVerifiedForSave = workerBankReviewStatus === 'verified' && (!workerBankChangedAfterReview || workerBankApprovedPayloadCurrent);
   const workerAllProfileCardsVerified = workerProfileCardVerifiedForSave && workerDocumentCardVerifiedForSave && workerBankCardVerifiedForSave;
   const workerAnyProfileCardPending = [workerProfileReviewStatus, workerDocumentReviewStatus, workerBankReviewStatus].some((s) => s === 'pending') && !(workerProfileChangedAfterReview || workerDocumentChangedAfterReview || workerBankChangedAfterReview);
-  const workerTopStatus = workerAllProfileCardsVerified ? 'verified' : workerAnyProfileCardPending ? 'pending' : 'unverified';
+  const workerTopStatus = finalSaved && workerAllProfileCardsVerified ? 'verified' : workerAnyProfileCardPending ? 'pending' : 'unverified';
 
   useEffect(() => {
     if (!workerAllProfileCardsVerified && finalSaved) {
@@ -6836,7 +6867,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
             <div className="flex items-center gap-2 mt-1 flex-wrap">
               {(() => { const r = pickProfileRating(me.extra || {}); return <TopProfileStarRating value={r.rating} count={r.count} color="indigo" />; })()}
               {workerTopStatus === 'verified' ? (
-                <Badge className="border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm"><CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Done</Badge>
+                <Badge className="border border-emerald-600 bg-emerald-600 text-white shadow-sm"><Star className="w-3.5 h-3.5 mr-1 fill-current" /> Verified</Badge>
               ) : workerTopStatus === 'pending' ? (
                 <Badge className="border border-amber-200 bg-amber-50 text-amber-700 shadow-sm"><Clock className="w-3.5 h-3.5 mr-1" /> Pending Approval</Badge>
               ) : (
@@ -7093,8 +7124,8 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
           disabled={busy || !workerAllProfileCardsVerified || finalSaved}
           className={`h-12 ${finalSaved ? 'bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-600 disabled:text-white' : 'bg-emerald-600 hover:bg-emerald-700'} shadow-lg shadow-emerald-600/20 disabled:!opacity-100 disabled:cursor-not-allowed`}
         >
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : finalSaved ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <Edit3 className="w-4 h-4 mr-2" />}
-          {finalSaved ? 'Saved' : 'Save profile'}
+          {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : finalSaved ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <Edit3 className="w-4 h-4 mr-2" />}
+          {busy ? 'Saving...' : finalSaved ? 'Saved' : 'Save profile'}
         </Button>
 
         <Button
@@ -7642,7 +7673,9 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
               <Camera className="w-4 h-4 mr-1.5" /> Capture
             </Button>
             <Button type="button" variant="outline" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate || cameraOn} onClick={startCamera}>Retake</Button>
-            <Button type="button" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" disabled={busy || disabled || !allowSelfieUpdate || !capturedBlob} onClick={submitFaceCheck}>{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Submit'}</Button>
+            <Button type="button" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" disabled={busy || disabled || !allowSelfieUpdate || !capturedBlob} onClick={submitFaceCheck}>
+              {busy ? <><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Submitting...</> : 'Submit'}
+            </Button>
           </div>
         </DialogContent>
       </Dialog>
@@ -7663,6 +7696,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
   const [mobile, setMobile] = useState('');
   const [otp, setOtp] = useState('');
   const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState('');
   const [sent, setSent] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const timerRef = useRef(null);
@@ -7705,6 +7739,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
 
   const sendOtp = async () => {
     try {
+      setBusyAction('send');
       setBusy(true);
       if (!normalized) {
         throw new Error('Enter a valid 10-digit mobile number');
@@ -7717,11 +7752,13 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
       toast.error(err.message || 'Failed to send OTP');
     } finally {
       setBusy(false);
+      setBusyAction('');
     }
   };
 
   const verifyOtp = async () => {
     try {
+      setBusyAction('verify');
       setBusy(true);
       if (!otp) throw new Error('Enter OTP');
       await api('auth/mobile-verify-otp', { method: 'POST', token, body: { phone: normalized, otp } });
@@ -7737,6 +7774,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
       toast.error(err.message || 'Verification failed');
     } finally {
       setBusy(false);
+      setBusyAction('');
     }
   };
 
@@ -7774,7 +7812,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
             disabled={busy || !canEdit || countdown > 0}
             className="border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-100 disabled:bg-emerald-50 disabled:text-emerald-700"
           >
-            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : countdown > 0 ? `Resend in ${countdown}s` : (sent ? 'Resend OTP' : 'Send OTP')}
+            {busy && busyAction === 'send' ? <><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Sending...</> : countdown > 0 ? `Resend in ${countdown}s` : (sent ? 'Resend OTP' : 'Send OTP')}
           </Button>
           {isVerified && editing ? (
             <Button type="button" variant="ghost" onClick={() => { setEditing(false); setMobile(phone || ''); setOtp(''); setSent(false); setCountdown(0); }}>Cancel</Button>
@@ -7791,7 +7829,9 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
       {canEdit && sent && (
         <div className="grid sm:grid-cols-[1fr_auto] gap-2 mt-2">
           <Input value={otp} onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="Enter 6-digit OTP" inputMode="numeric" />
-          <Button type="button" className="bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" onClick={verifyOtp} disabled={busy || otp.length !== 6}>Verify</Button>
+          <Button type="button" className="bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" onClick={verifyOtp} disabled={busy || otp.length !== 6}>
+            {busy && busyAction === 'verify' ? <><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Verifying...</> : 'Verify'}
+          </Button>
         </div>
       )}
     </div>
@@ -7961,7 +8001,7 @@ function EmployerApp({ auth, onLogout }) {
   useEffect(() => { if (token) { refreshMe(); refreshJobs(); } }, [token]);
   useEffect(() => {
     if (!token || tab !== 'profile') return undefined;
-    const timer = setInterval(() => refreshMe(), 4000);
+    const timer = setInterval(() => refreshMe(), 2000);
     return () => clearInterval(timer);
   }, [token, tab]);
 
@@ -10064,7 +10104,7 @@ useEffect(() => {
             <div className="flex items-center gap-2 mt-1 flex-wrap">
               {(() => { const r = pickProfileRating(employerExtra); return <TopProfileStarRating value={r.rating} count={r.count} color="emerald" />; })()}
               {employerTopStatus === 'verified' ? (
-                <Badge className="border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm"><CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Done</Badge>
+                <Badge className="border border-emerald-600 bg-emerald-600 text-white shadow-sm"><Star className="w-3.5 h-3.5 mr-1 fill-current" /> Verified</Badge>
               ) : employerTopStatus === 'pending' ? (
                 <Badge className="border border-amber-200 bg-amber-50 text-amber-700 shadow-sm"><Clock className="w-3.5 h-3.5 mr-1" /> Pending Approval</Badge>
               ) : (
@@ -10180,8 +10220,8 @@ useEffect(() => {
           disabled={busy || !employerAllProfileCardsVerified || finalSaved}
           className="h-12 bg-emerald-600 hover:bg-emerald-700 shadow-lg shadow-emerald-600/20 disabled:!opacity-100 disabled:cursor-not-allowed disabled:bg-emerald-600 disabled:text-white"
         >
-          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : finalSaved ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <Edit3 className="w-4 h-4 mr-2" />}
-          {finalSaved ? 'Saved' : 'Save profile'}
+          {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : finalSaved ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <Edit3 className="w-4 h-4 mr-2" />}
+          {busy ? 'Saving...' : finalSaved ? 'Saved' : 'Save profile'}
         </Button>
 
         <Button

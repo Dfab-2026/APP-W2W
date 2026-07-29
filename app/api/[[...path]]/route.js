@@ -193,18 +193,26 @@ async function readVerificationSectionStates(admin, userId) {
   return { statuses, rows: data || [], error: null };
 }
 
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, required = false }) {
   try {
-    if (!process.env.RESEND_API_KEY) return;
+    if (!process.env.RESEND_API_KEY) {
+      throw new Error('Email service is not configured. Add RESEND_API_KEY in Vercel and redeploy.');
+    }
     const resend = new Resend(process.env.RESEND_API_KEY);
-    await resend.emails.send({
+    const { data, error } = await resend.emails.send({
       from: 'Work2Wish <work2wish@work2wish.com>',
       to: [to],
       subject,
       html,
     });
+    if (error) {
+      throw new Error(error.message || 'Email delivery was rejected.');
+    }
+    return data;
   } catch (e) {
-    console.warn('Resend email failed:', e?.message);
+    console.error('Resend email failed:', e?.message);
+    if (required) throw e;
+    return null;
   }
 }
 
@@ -593,10 +601,11 @@ async function route(request, { params }) {
       if (insErr) return err(insErr.message, 400);
 
       // Send via Resend
-      sendEmail({
+      await sendEmail({
         to: email,
         subject: `Your Work2Wish code: ${code}`,
         html: otpEmailHtml(code, full_name),
+        required: true,
       });
 
       return json({ ok: true, expires_at });
@@ -690,10 +699,11 @@ async function route(request, { params }) {
       const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
       await admin.from('otp_codes').update({ consumed: true }).eq('email', email).eq('consumed', false);
       await admin.from('otp_codes').insert({ email, code, expires_at, payload: prev.payload });
-      sendEmail({
+      await sendEmail({
         to: email,
         subject: `Your Work2Wish code: ${code}`,
         html: otpEmailHtml(code, prev.payload?.full_name),
+        required: true,
       });
       return json({ ok: true, expires_at });
     }
@@ -713,10 +723,11 @@ async function route(request, { params }) {
           email, code, expires_at,
           payload: { type: 'reset', user_id: prof.id, full_name: prof.full_name },
         });
-        sendEmail({
+        await sendEmail({
           to: email,
           subject: `Work2Wish password reset code: ${code}`,
           html: otpEmailHtml(code, prof.full_name).replace('Verify your email', 'Reset your password'),
+          required: true,
         });
       }
       return json({ ok: true });
@@ -863,6 +874,7 @@ async function route(request, { params }) {
         to: email,
         subject: `Your Work2Wish code: ${code}`,
         html: otpEmailHtml(code, full_name),
+        required: true,
       });
 
       return json({ ok: true, expires_at });
@@ -1476,6 +1488,17 @@ async function route(request, { params }) {
         verification_section_rows = durable.rows || [];
         section_statuses = { ...section_statuses, ...(durable.statuses || {}) };
       } catch (_) {}
+
+      // Final admin verification is authoritative for every required card.
+      // A later user edit/submission sets `verified` back to false, so this
+      // cannot hide a genuine re-verification request.
+      if (extra?.verified === true && extra?.verification_status === 'verified') {
+        const requiredSections = profile?.role === 'worker' ? ['profile', 'documents', 'bank'] : ['profile', 'documents'];
+        for (const section of requiredSections) {
+          section_statuses[section] = 'verified';
+          if (section === 'documents') section_statuses.verification = 'verified';
+        }
+      }
 
       return json({ profile, extra, section_statuses, verification_section_rows });
     }
