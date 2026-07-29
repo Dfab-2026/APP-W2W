@@ -106,6 +106,9 @@ async function buildPendingSectionPayload(admin, table, userId, section) {
 
 async function persistVerifiedSections(admin, table, userId, sections = [], extraPayload = {}) {
   const normalized = sections.map(normalizeVerifySectionName);
+  const sectionOnly = extraPayload?.__sectionOnly === true;
+  const cleanExtraPayload = { ...(extraPayload || {}) };
+  delete cleanExtraPayload.__sectionOnly;
   let current = null;
   try {
     const { data, error } = await admin
@@ -132,14 +135,13 @@ async function persistVerifiedSections(admin, table, userId, sections = [], extr
     directFlags.verification_verified = true;
   }
   const payload = {
-    ...extraPayload,
+    ...cleanExtraPayload,
     ...directFlags,
     section_statuses: sectionStatuses,
     verified_sections: verifiedSections,
-    verification_status: 'verified',
     verification_notes: null,
-    verified_at: nowIso,
     updated_at: nowIso,
+    ...(sectionOnly ? {} : { verification_status: 'verified', verified_at: nowIso }),
   };
   let { error } = await admin.from(table).update(payload).eq('user_id', userId);
   if (error && String(error.message || '').toLowerCase().includes('column')) {
@@ -155,6 +157,40 @@ async function persistVerifiedSections(admin, table, userId, sections = [], extr
     ({ error } = await admin.from(table).update(safePayload).eq('user_id', userId));
   }
   return { error };
+}
+
+
+async function upsertVerificationSectionState(admin, userId, role, section, status, actorId = null) {
+  const normalizedSection = normalizeVerifySectionName(section || 'profile');
+  const normalizedStatus = ['draft', 'pending', 'verified', 'rejected'].includes(status) ? status : 'draft';
+  const nowIso = new Date().toISOString();
+  const payload = {
+    user_id: userId,
+    role: role || null,
+    section: normalizedSection,
+    status: normalizedStatus,
+    submitted_at: normalizedStatus === 'pending' ? nowIso : null,
+    verified_at: normalizedStatus === 'verified' ? nowIso : null,
+    verified_by: normalizedStatus === 'verified' ? actorId : null,
+    updated_at: nowIso,
+  };
+  const { error } = await admin
+    .from('user_verification_sections')
+    .upsert(payload, { onConflict: 'user_id,section' });
+  return { error };
+}
+
+async function readVerificationSectionStates(admin, userId) {
+  const { data, error } = await admin
+    .from('user_verification_sections')
+    .select('section,status,submitted_at,verified_at,verified_by,updated_at')
+    .eq('user_id', userId);
+  if (error) return { statuses: {}, rows: [], error };
+  const statuses = {};
+  for (const row of data || []) {
+    statuses[normalizeVerifySectionName(row.section)] = row.status;
+  }
+  return { statuses, rows: data || [], error: null };
 }
 
 async function sendEmail({ to, subject, html }) {
@@ -1153,7 +1189,19 @@ async function route(request, { params }) {
         const { data } = await admin.from('employers').select('*').eq('user_id', userId).maybeSingle();
         extra = data;
       }
-      return { ...profile, ...(extra || {}) };
+      let durableStatuses = {};
+      let verificationSectionRows = [];
+      try {
+        const durable = await readVerificationSectionStates(admin, userId);
+        durableStatuses = durable.statuses || {};
+        verificationSectionRows = durable.rows || [];
+      } catch (_) {}
+      return {
+        ...profile,
+        ...(extra || {}),
+        section_statuses: { ...((extra || {}).section_statuses || {}), ...durableStatuses },
+        verification_section_rows: verificationSectionRows,
+      };
     }
 
     if (path === 'admin/users' && method === 'GET') {
@@ -1259,6 +1307,8 @@ async function route(request, { params }) {
         error = result.error;
         if (!error) {
           for (const section of sectionsToVerify) {
+            const stateResult = await upsertVerificationSectionState(admin, userId, profile.role, section, 'verified', me.id);
+            if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
             await logActivity(admin, userId, 'admin_verified_section', { section, label: section === 'bank' ? 'Bank Details' : section === 'documents' ? 'Documents' : 'Profile' }, me.id);
             await logActivity(admin, me.id, 'verified_profile_section', { user_id: userId, section, role: profile.role }, me.id);
           }
@@ -1301,8 +1351,10 @@ async function route(request, { params }) {
         // when activity log rows share close timestamps or the client reloads before logs settle.
         const table = profile.role === 'worker' ? 'workers' : 'employers';
         const sectionKey = normalizeVerifySectionName(section);
-        const result = await persistVerifiedSections(admin, table, userId, [sectionKey], { verification_section: sectionKey });
+        const result = await persistVerifiedSections(admin, table, userId, [sectionKey], { verification_section: sectionKey, __sectionOnly: true });
         if (result.error) return err(result.error.message, 400);
+        const stateResult = await upsertVerificationSectionState(admin, userId, profile.role, sectionKey, 'verified', me.id);
+        if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
         await notify(admin, userId, `${label} verified`, `Admin verified your ${label.toLowerCase()} section.`, 'verification_section', userId);
       }
       await logActivity(admin, userId, body.messageOnly ? 'admin_sent_message' : 'admin_verified_section', { section, label, message: body.message || null }, me.id);
@@ -1414,7 +1466,18 @@ async function route(request, { params }) {
       } catch (e) {
         section_statuses = {};
       }
-      return json({ profile, extra, section_statuses });
+
+      // Durable section state is the final source of truth across localhost,
+      // Vercel and app.work2wish.com. It prevents a global verification field
+      // or an older activity row from changing only one card incorrectly.
+      let verification_section_rows = [];
+      try {
+        const durable = await readVerificationSectionStates(admin, me.id);
+        verification_section_rows = durable.rows || [];
+        section_statuses = { ...section_statuses, ...(durable.statuses || {}) };
+      } catch (_) {}
+
+      return json({ profile, extra, section_statuses, verification_section_rows });
     }
 
     if (path === 'me/activity' && method === 'GET') {
@@ -1459,9 +1522,18 @@ async function route(request, { params }) {
       const role = profile?.role;
       let updatedExtra = null;
 
+      const requestedSection = normalizeVerifySectionName(body.verification_section || 'profile');
+      if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
+        const stateResult = await upsertVerificationSectionState(admin, me.id, role, requestedSection, 'pending', null);
+        if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
+      } else if (body.verification_status === 'not_submitted' || body.verification_status === 'draft' || body.verification_status === 'modified') {
+        const stateResult = await upsertVerificationSectionState(admin, me.id, role, requestedSection, 'draft', null);
+        if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
+      }
+
       if (role === 'worker') {
         const wf = ['age', 'gender', 'skills', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known',
-                    'bank_account', 'account_holder_name', 'bank_name', 'ifsc_code', 'branch_name', 'upi_id', 'bank_qr_url', 'selfie_url', 'selfie_front_url', 'selfie_left_url', 'selfie_right_url', 'selfie_verified', 'selfie_verified_at', 'certificate_url', 'previous_employer_reference',
+                    'bank_account', 'account_holder_name', 'bank_name', 'ifsc_code', 'branch_name', 'upi_id', 'bank_qr_url', 'selfie_url', 'selfie_front_url', 'selfie_left_url', 'selfie_right_url', 'selfie_verified', 'selfie_verified_at', 'certificate_url', 'resume_url', 'previous_employer_reference',
                     'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'bio', 'available', 'address',
                     'aadhaar_number', 'pan_number', 'aadhaar_front_url', 'aadhaar_back_url', 'pan_image_url', 'pan_back_url',
                     'verification_status', 'verification_section', 'verification_notes', 'badge_immediate_joiner'];
@@ -1471,6 +1543,9 @@ async function route(request, { params }) {
         if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
           const pendingSection = normalizeVerifySectionName(body.verification_section || 'profile');
           Object.assign(wu, await buildPendingSectionPayload(admin, 'workers', me.id, pendingSection));
+          // Keep every untouched section verified, but reopen the overall account
+          // verification when this one card is changed and resubmitted. Admin reviews
+          // only this pending card, approves it, then performs Final Verify again.
           wu.verified = false;
           wu.verification_status = 'pending';
           wu.verification_section = pendingSection;
@@ -1495,6 +1570,9 @@ async function route(request, { params }) {
         if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
           const pendingSection = normalizeVerifySectionName(body.verification_section || 'profile');
           Object.assign(eu, await buildPendingSectionPayload(admin, 'employers', me.id, pendingSection));
+          // Keep every untouched section verified, but reopen the overall account
+          // verification when this one card is changed and resubmitted. Admin reviews
+          // only this pending card, approves it, then performs Final Verify again.
           eu.verified = false;
           eu.verification_status = 'pending';
           eu.verification_section = pendingSection;

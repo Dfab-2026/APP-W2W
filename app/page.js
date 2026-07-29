@@ -2,7 +2,7 @@
 
 
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Briefcase, HardHat, MapPin, Map, Search, Bell, Star, Phone, Send, Plus, LogOut,
@@ -1590,7 +1590,17 @@ function AdminApp({ auth, onLogout }) {
       toast.error(adminUserRole === 'worker' ? 'Verify Profile, Bank Details and Verification section first' : 'Verify Profile and Employer Verification section first');
       return;
     }
+    const previousSelected = selected;
     setBusy(true);
+    if (verified) {
+      // Keep the final action green immediately and permanently after approval.
+      setSelected((current) => current?.id === id ? {
+        ...current,
+        verified: true,
+        verification_status: 'verified',
+        extra: { ...(current.extra || {}), verified: true, verification_status: 'verified' },
+      } : current);
+    }
     try {
       const body = { verified };
       if (selected?.role === 'worker') {
@@ -1604,8 +1614,24 @@ function AdminApp({ auth, onLogout }) {
       await api(`admin/users/${id}/verify`, { method: 'PATCH', token, body });
       toast.success(verified ? 'Account verified' : 'Verification rejected');
       await loadUsers();
-      if (selected?.id === id) await openDetails(selected);
-    } catch (e) { toast.error(e.message); } finally { setBusy(false); }
+      if (selected?.id === id) {
+        const detail = await api(`admin/users/${id}`, { token });
+        if (detail?.user) {
+          setSelected({
+            ...detail.user,
+            verified: verified ? true : !!detail.user.verified,
+            verification_status: verified ? 'verified' : detail.user.verification_status,
+            extra: {
+              ...(detail.user.extra || {}),
+              ...(verified ? { verified: true, verification_status: 'verified' } : {}),
+            },
+          });
+        }
+      }
+    } catch (e) {
+      setSelected(previousSelected);
+      toast.error(e.message);
+    } finally { setBusy(false); }
   };
 
   const activityDetails = (row) => {
@@ -1661,14 +1687,56 @@ function AdminApp({ auth, onLogout }) {
   const adminRequiredSectionsDone = adminRequiredSections.every(isSectionVerified);
 
   const verifySection = async (section) => {
-    if (!selected?.id) return;
+    if (!selected?.id || busy) return;
+    const normalizedSection = normalizeVerificationSection(section);
+    const selectedId = selected.id;
     setBusy(true);
+    // Optimistic update: the card turns green instantly after approval.
+    setSelected((current) => {
+      if (!current || current.id !== selectedId) return current;
+      const previousStatuses = current.section_statuses || current.extra?.section_statuses || {};
+      const nextStatuses = {
+        ...previousStatuses,
+        [normalizedSection]: 'verified',
+        ...(normalizedSection === 'documents' ? { verification: 'verified' } : {}),
+      };
+      return {
+        ...current,
+        section_statuses: nextStatuses,
+        extra: { ...(current.extra || {}), section_statuses: nextStatuses },
+      };
+    });
     try {
-      await api(`admin/users/${selected.id}/section-verify`, { method: 'PATCH', token, body: { section } });
-      toast.success('Section verified');
-      await openDetails(selected);
+      await api(`admin/users/${selectedId}/section-verify`, { method: 'PATCH', token, body: { section: normalizedSection } });
+      toast.success('Marked as approved');
+      const detail = await api(`admin/users/${selectedId}`, { token });
+      if (detail?.user) {
+        setSelected((current) => {
+          const persistedStatuses = detail.user.section_statuses || detail.user.extra?.section_statuses || {};
+          const currentStatuses = current?.section_statuses || current?.extra?.section_statuses || {};
+          const nextStatuses = {
+            ...persistedStatuses,
+            ...currentStatuses,
+            [normalizedSection]: 'verified',
+            ...(normalizedSection === 'documents' ? { verification: 'verified' } : {}),
+          };
+          return {
+            ...detail.user,
+            section_statuses: nextStatuses,
+            extra: { ...(detail.user.extra || {}), section_statuses: nextStatuses },
+          };
+        });
+      }
       await loadUsers();
-    } catch (e) { toast.error(e.message || 'Unable to verify section'); } finally { setBusy(false); }
+    } catch (e) {
+      toast.error(e.message || 'Unable to verify section');
+      try {
+        const detail = await api(`admin/users/${selectedId}`, { token });
+        if (detail?.user) setSelected(detail.user);
+      } catch (_) {}
+    } finally {
+      setBusy(false);
+    }
   };
 
   const sendAdminProfileMessage = async () => {
@@ -1702,7 +1770,7 @@ function AdminApp({ auth, onLogout }) {
   });
 
   return (
-    <div className="h-[100dvh] overflow-y-auto overflow-x-hidden bg-[radial-gradient(circle_at_top_left,_#dbeafe_0,_#f8fafc_34%,_#eef2ff_72%,_#f8fafc_100%)] text-slate-950">
+    <div className="w2w-admin-panel h-[100dvh] overflow-y-auto overflow-x-hidden bg-[radial-gradient(circle_at_top_left,_#dbeafe_0,_#f8fafc_34%,_#eef2ff_72%,_#f8fafc_100%)] text-slate-950">
       <header className="sticky top-0 z-30 border-b border-white/60 bg-slate-950/95 text-white backdrop-blur-2xl shadow-2xl shadow-slate-950/20">
         <div className="container py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
@@ -1823,25 +1891,25 @@ function AdminApp({ auth, onLogout }) {
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto rounded-xl border border-slate-200">
-              <table className="w-full text-sm bg-white">
+              <table className="w-full min-w-[1180px] table-fixed text-sm bg-white">
                 <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
                   <tr>
-                    <th className="text-left p-3">User</th>
-                    <th className="text-left p-3">Role</th>
-                    <th className="text-left p-3">Login ID</th>
-                    <th className="text-left p-3">Cards</th>
-                    <th className="text-left p-3">Location</th>
-                    <th className="text-left p-3">Status</th>
-                    <th className="text-right p-3">Actions</th>
+                    <th className="w-[250px] text-left p-3 whitespace-nowrap">User</th>
+                    <th className="w-[110px] text-left p-3 whitespace-nowrap">Role</th>
+                    <th className="w-[130px] text-left p-3 whitespace-nowrap">Login ID</th>
+                    <th className="w-[210px] text-left p-3 whitespace-nowrap">Cards</th>
+                    <th className="w-[250px] text-left p-3 whitespace-nowrap">Location</th>
+                    <th className="w-[150px] text-left p-3 whitespace-nowrap">Status</th>
+                    <th className="w-[240px] text-right p-3 whitespace-nowrap">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {localFiltered.map((u) => (
                     <tr key={u.id} className="border-t border-slate-100 align-top transition hover:bg-blue-50/50">
-                      <td className="p-3 min-w-64"><p className="font-semibold">{u.full_name || u.company_name || 'No name'}</p><p className="text-xs text-muted-foreground">{u.email}</p>{u.company_name && <p className="text-xs text-muted-foreground">{u.company_name}</p>}</td>
-                      <td className="p-3 capitalize"><Badge variant="secondary">{u.role}</Badge></td>
-                      <td className="p-3">{u.login_id || '—'}</td>
-                      <td className="p-3 min-w-52">
+                      <td className="p-3 align-middle overflow-hidden"><p className="font-semibold">{u.full_name || u.company_name || 'No name'}</p><p className="text-xs text-muted-foreground">{u.email}</p>{u.company_name && <p className="text-xs text-muted-foreground">{u.company_name}</p>}</td>
+                      <td className="p-3 align-middle capitalize whitespace-nowrap"><Badge variant="secondary">{u.role}</Badge></td>
+                      <td className="p-3 align-middle whitespace-nowrap">{u.login_id || '—'}</td>
+                      <td className="p-3 align-middle">
                         {u.role === 'worker' ? (
                           <>
                             <p className="text-xs">Aadhaar: {u.aadhaar_number || '—'}</p>
@@ -1856,8 +1924,8 @@ function AdminApp({ auth, onLogout }) {
                           <p className="text-xs text-muted-foreground">Admin account</p>
                         )}
                       </td>
-                      <td className="p-3 min-w-72"><p className="line-clamp-2">{u.location_text || 'No saved location'}</p>{u.latitude && u.longitude && <p className="text-xs text-muted-foreground">{formatCoordinates(u.latitude, u.longitude)}</p>}</td>
-                      <td className="p-3 space-y-1">
+                      <td className="p-3 align-middle"><p className="line-clamp-2">{u.location_text || 'No saved location'}</p>{u.latitude && u.longitude && <p className="text-xs text-muted-foreground">{formatCoordinates(u.latitude, u.longitude)}</p>}</td>
+                      <td className="p-3 align-middle space-y-1 whitespace-nowrap">
                         {u.blocked ? <Badge className="bg-red-100 text-red-700">Blocked</Badge> : <Badge className="bg-emerald-100 text-emerald-700">Active</Badge>}
                         {u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Unverified'}</Badge>}
                         {(() => {
@@ -1870,11 +1938,11 @@ function AdminApp({ auth, onLogout }) {
                           return null;
                         })()}
                       </td>
-                      <td className="p-3 text-right">
-                        <div className="flex justify-end gap-2 flex-wrap">
-                          <Button size="sm" variant="outline" onClick={() => openDetails(u)} className="rounded-lg border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100">View</Button>
-                          <Button size="sm" variant="outline" disabled={busy || u.role === 'admin'} onClick={() => blockUser(u.id, !u.blocked)}>{u.blocked ? 'Unblock' : 'Block'}</Button>
-                          <Button size="sm" variant="destructive" disabled={busy || u.role === 'admin'} onClick={() => deleteUser(u.id, u.email)}>Delete</Button>
+                      <td className="p-3 align-middle text-right">
+                        <div className="flex justify-end gap-2 flex-nowrap whitespace-nowrap">
+                          <Button type="button" size="sm" variant="outline" onClick={() => openDetails(u)} className="whitespace-nowrap rounded-lg border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100">View</Button>
+                          <Button type="button" size="sm" variant="outline" disabled={busy || u.role === 'admin'} onClick={() => blockUser(u.id, !u.blocked)}>{u.blocked ? 'Unblock' : 'Block'}</Button>
+                          <Button type="button" size="sm" variant="destructive" disabled={busy || u.role === 'admin'} onClick={() => deleteUser(u.id, u.email)}>Delete</Button>
                         </div>
                       </td>
                     </tr>
@@ -1989,7 +2057,13 @@ function AdminApp({ auth, onLogout }) {
                   const submittedAt = selected.verification_submitted_at ? new Date(selected.verification_submitted_at) : null;
                   const verifiedAt = selected.verified_at ? new Date(selected.verified_at) : null;
                   const needsReview = submittedAt && (!verifiedAt || submittedAt.getTime() > verifiedAt.getTime());
-                  if (needsReview) return <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><Badge className="bg-amber-100 text-amber-800 mr-2">Updated</Badge>Documents changed. Review all three sections and verify account again.</div>;
+                  if (needsReview) {
+                    const updatedSection = normalizeVerificationSection(
+                      selected.verification_section || selected.pending_verification_section || selected.extra?.verification_section || selected.extra?.pending_verification_section || 'profile'
+                    );
+                    const updatedLabel = updatedSection === 'bank' ? 'Bank Details' : updatedSection === 'documents' ? (selected.role === 'worker' ? 'Worker Verification' : 'Employer Verification') : 'Profile';
+                    return <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><Badge className="bg-amber-100 text-amber-800 mr-2">Updated</Badge>{updatedLabel} was updated. Review only that card; previously approved cards remain approved.</div>;
+                  }
                 } catch (e) {}
                 return null;
               })()}
@@ -2004,10 +2078,19 @@ function AdminApp({ auth, onLogout }) {
               </motion.div>
 
               <div className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <Button disabled={busy || adminUserRole === 'admin' || !adminRequiredSectionsDone} onClick={() => verifyUser(selected.id, true)} className="bg-emerald-600 hover:bg-emerald-700"><ShieldCheck className="w-4 h-4 mr-2" /> Final verify account</Button>
-                <Button disabled={busy || selected.role === 'admin'} variant="outline" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>
-                <Button disabled={busy || selected.role === 'admin'} variant="outline" onClick={() => blockUser(selected.id, !selected.blocked)}>{selected.blocked ? 'Unblock user' : 'Block user'}</Button>
-                <Button disabled={busy || selected.role === 'admin'} variant="destructive" onClick={() => deleteUser(selected.id, selected.email)}>Delete user</Button>
+                <Button
+                  type="button"
+                  disabled={busy || adminUserRole === 'admin' || !!selected.verified || !adminRequiredSectionsDone}
+                  onClick={() => verifyUser(selected.id, true)}
+                  className="whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 disabled:!bg-emerald-600 disabled:!text-white disabled:!opacity-100 disabled:cursor-default"
+                  style={selected.verified ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
+                >
+                  {selected.verified ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <ShieldCheck className="w-4 h-4 mr-2" />}
+                  <span className="whitespace-nowrap">{selected.verified ? 'Account verified' : 'Final verify account'}</span>
+                </Button>
+                <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>
+                <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => blockUser(selected.id, !selected.blocked)}>{selected.blocked ? 'Unblock user' : 'Block user'}</Button>
+                <Button type="button" disabled={busy || selected.role === 'admin'} variant="destructive" className="whitespace-nowrap" onClick={() => deleteUser(selected.id, selected.email)}>Delete user</Button>
               </div>
 
               {selected.role === 'employer' && (
@@ -2077,12 +2160,12 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
     amber: { shell: 'border-amber-200/80 bg-gradient-to-br from-white via-amber-50/50 to-orange-50/70', icon: 'bg-amber-500', ring: 'shadow-amber-100' },
   }[tone] || { shell: 'border-indigo-200/80 bg-white', icon: 'bg-indigo-600', ring: 'shadow-indigo-100' };
   const meta = normalizedStatus === 'verified'
-    ? { label: 'Verified', badge: 'border-emerald-200 bg-emerald-50 text-emerald-700', button: 'bg-emerald-600 hover:bg-emerald-700', buttonLabel: 'Done', ButtonIcon: CheckCircle2 }
+    ? { label: 'Verified', badge: 'border-emerald-200 bg-emerald-50 text-emerald-700', button: 'bg-emerald-600 hover:bg-emerald-700', buttonLabel: 'Approved', ButtonIcon: CheckCircle2 }
     : normalizedStatus === 'pending'
-      ? { label: 'Awaiting review', badge: 'border-amber-200 bg-amber-50 text-amber-700', button: 'bg-amber-500 hover:bg-amber-600', buttonLabel: 'Approve section', ButtonIcon: Clock }
+      ? { label: 'Awaiting review', badge: 'border-amber-200 bg-amber-50 text-amber-700', button: 'bg-amber-500 hover:bg-amber-600', buttonLabel: 'Mark as approved', ButtonIcon: Clock }
       : normalizedStatus === 'rejected'
-        ? { label: 'Needs correction', badge: 'border-rose-200 bg-rose-50 text-rose-700', button: 'bg-rose-600 hover:bg-rose-700', buttonLabel: 'Verify after correction', ButtonIcon: XCircle }
-        : { label: 'Not submitted', badge: 'border-slate-200 bg-slate-50 text-slate-600', button: 'bg-slate-900 hover:bg-slate-800', buttonLabel: 'Verify section', ButtonIcon: ShieldCheck };
+        ? { label: 'Needs correction', badge: 'border-rose-200 bg-rose-50 text-rose-700', button: 'bg-rose-600 hover:bg-rose-700', buttonLabel: 'Mark as approved', ButtonIcon: XCircle }
+        : { label: 'Not submitted', badge: 'border-slate-200 bg-slate-50 text-slate-600', button: 'bg-slate-900 hover:bg-slate-800', buttonLabel: 'Mark as approved', ButtonIcon: ShieldCheck };
   const ActionIcon = meta.ButtonIcon;
   return (
     <motion.section whileHover={{ y: -4 }} transition={{ type: 'spring', stiffness: 260, damping: 24 }} className={`relative overflow-hidden rounded-[28px] border ${palette.shell} p-5 shadow-xl ${palette.ring}`}>
@@ -2091,12 +2174,19 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
         <div className="flex min-w-0 items-start gap-3">
           <div className={`grid h-11 w-11 shrink-0 place-items-center rounded-2xl ${palette.icon} text-white shadow-lg`}>{icon}</div>
           <div className="min-w-0">
-            <h3 className="font-black text-slate-950 leading-tight">{title}</h3>
-            <Badge className={`mt-2 border px-2.5 py-1 font-bold ${meta.badge}`}>{meta.label}</Badge>
+            <h3 className="font-black text-slate-950 leading-tight whitespace-nowrap">{title}</h3>
+            <Badge className={`mt-2 border px-2.5 py-1 font-bold whitespace-nowrap ${meta.badge}`}>{meta.label}</Badge>
           </div>
         </div>
-        <Button size="sm" disabled={disabled || normalizedStatus === 'verified'} onClick={onVerify} className={`${meta.button} min-w-[132px] rounded-xl text-white shadow-md disabled:!opacity-100`}>
-          <ActionIcon className="w-4 h-4 mr-1.5" /> {meta.buttonLabel}
+        <Button
+          type="button"
+          size="sm"
+          disabled={disabled || normalizedStatus === 'verified'}
+          onClick={(event) => { event.preventDefault(); event.stopPropagation(); onVerify?.(); }}
+          className={`${meta.button} h-10 min-w-[168px] shrink-0 whitespace-nowrap rounded-xl px-4 text-white shadow-md disabled:!opacity-100 disabled:cursor-default`}
+          style={normalizedStatus === 'verified' ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
+        >
+          <ActionIcon className="w-4 h-4 mr-1.5 shrink-0" /> <span className="whitespace-nowrap">{meta.buttonLabel}</span>
         </Button>
       </div>
       <div className="relative space-y-3">{children}</div>
@@ -3346,10 +3436,17 @@ function WorkerApp({ auth, onLogout }) {
     return () => window.removeEventListener('popstate', handleBrowserBack);
   }, []);
 
-  const refreshMe = async () => {
-    try { const data = await api('me', { token }); setMe(data); } catch (e) { toast.error(e.message); }
+  const refreshMe = async (options = {}) => {
+    try { const data = await api('me', { token }); setMe(data); } catch (e) {
+      if (options?.silent !== true) toast.error(e.message);
+    }
   };
   useEffect(() => { if (token) { refreshMe(); } }, [token]);
+  useEffect(() => {
+    if (!token || tab !== 'profile') return undefined;
+    const timer = setInterval(() => refreshMe({ silent: true }), 4000);
+    return () => clearInterval(timer);
+  }, [token, tab]);
 
   useEffect(() => {
     if (!me?.profile?.id || !token) return;
@@ -5627,9 +5724,10 @@ function SavedLocationEditor({ label, value, latitude, longitude, color = 'indig
 }
 
 
-function VerificationDocumentsCard({ token, me, role, verified, form, setForm, onSaved, color = 'indigo' }) {
+function VerificationDocumentsCard({ token, me, role, verified, form, setForm, onSaved, onStatusChange, color = 'indigo' }) {
   const [busy, setBusy] = useState(false);
   const [localDocumentEdited, setLocalDocumentEdited] = useState(false);
+  const [localReviewStatus, setLocalReviewStatus] = useState('');
   const accent = color === 'emerald' ? 'emerald' : 'indigo';
   const isEmployer = role === 'employer';
   const documentReviewStatus = sectionReviewState(me, 'documents', form.verification_status, verified);
@@ -5639,8 +5737,20 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
     me?.profile || {},
     me?.extra || {}
   );
-  const status = (localDocumentEdited || documentChangedAfterReview) ? 'modified' : documentReviewStatus;
+  const status = localDocumentEdited
+    ? 'modified'
+    : localReviewStatus === 'pending'
+      ? 'pending'
+      : documentChangedAfterReview
+        ? 'modified'
+        : (localReviewStatus || documentReviewStatus);
   const lockedVerified = status === 'verified' && !localDocumentEdited && !documentChangedAfterReview;
+
+  useEffect(() => {
+    if (!['verified', 'pending', 'rejected'].includes(documentReviewStatus)) return;
+    setLocalReviewStatus('');
+    onStatusChange?.('documents', documentReviewStatus);
+  }, [documentReviewStatus, onStatusChange]);
 
   const cleanAadhaar = (value) => String(value || '').replace(/\D/g, '').slice(0, 20);
   const cleanPan = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
@@ -5657,6 +5767,8 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
       verification_section: 'documents',
     }));
     setLocalDocumentEdited(true);
+    setLocalReviewStatus('modified');
+    onStatusChange?.('documents', 'modified');
   };
 
   const uploadDoc = async (file, field, kind) => {
@@ -5716,6 +5828,8 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
       await api('me/profile', { method: 'PATCH', token, body });
       setForm((s) => ({ ...s, ...body }));
       setLocalDocumentEdited(false);
+      setLocalReviewStatus('pending');
+      onStatusChange?.('documents', 'pending');
       toast.success('Verification submitted for admin review');
       onSaved?.();
     } catch (e) {
@@ -6161,6 +6275,45 @@ function hasVerifySectionChanged(fields = [], current = {}, profile = {}, extra 
   return fields.some((key) => normalizeVerifyValue(key, current[key]) !== normalizeVerifyValue(key, extraValueForKey(profile, extra, key)));
 }
 
+function verificationPayloadFingerprint(payload = {}) {
+  const stableValue = (value) => {
+    if (Array.isArray(value)) return value.map(stableValue);
+    if (value && typeof value === 'object') {
+      return Object.keys(value)
+        .sort()
+        .reduce((out, key) => {
+          if (value[key] !== undefined) out[key] = stableValue(value[key]);
+          return out;
+        }, {});
+    }
+    return value ?? null;
+  };
+
+  const serialized = JSON.stringify(stableValue(payload || {}));
+  let hash = 2166136261;
+  for (let i = 0; i < serialized.length; i += 1) {
+    hash ^= serialized.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function verificationPendingStorageKey(me, section) {
+  const normalizedSection = normalizeVerifySectionName(section);
+  const userKey = me?.profile?.id || me?.id || me?.profile?.email || 'me';
+  return `w2w-verification-pending-${userKey}-${normalizedSection}`;
+}
+
+function submittedVerificationPayloadMatches(me, section, payload = {}) {
+  if (typeof window === 'undefined') return false;
+  try {
+    const storedFingerprint = localStorage.getItem(`${verificationPendingStorageKey(me, section)}-payload`) || '';
+    return !!storedFingerprint && storedFingerprint === verificationPayloadFingerprint(payload);
+  } catch {
+    return false;
+  }
+}
+
 function isFinalCardVerified(me, section, fallbackStatus, globalVerified, modified = false) {
   return sectionReviewState(me, section, fallbackStatus, globalVerified) === 'verified' && !modified;
 }
@@ -6189,35 +6342,97 @@ function pickEmployerDraftFields(data = {}) {
   return out;
 }
 
-function SectionVerificationAction({ token, me, section, title, description, color = 'indigo', setForm, onSaved, disabled = false, payloadBuilder = null, validate = null, modified = false }) {
+function SectionVerificationAction({ token, me, section, title, description, color = 'indigo', setForm, onSaved, onStatusChange, disabled = false, payloadBuilder = null, validate = null, modified = false, currentVerificationStatus = '', currentVerificationSection = '' }) {
   const [busy, setBusy] = useState(false);
   const verified = !!me?.extra?.verified;
-  const rawStatus = sectionReviewState(me, section, me?.extra?.verification_status, verified);
-  const pendingStorageKey = `w2w-verification-pending-${me?.profile?.id || me?.id || 'me'}-${normalizeVerifySectionName(section)}`;
-  const [localStatus, setLocalStatus] = useState(rawStatus);
-  const [submittedLocally, setSubmittedLocally] = useState(() => {
-    if (typeof window === 'undefined') return false;
-    return sessionStorage.getItem(pendingStorageKey) === '1';
+  const normalizedSectionName = normalizeVerifySectionName(section);
+  const currentSectionName = normalizeVerifySectionName(currentVerificationSection);
+  const currentFormStatus = currentSectionName === normalizedSectionName
+    ? normalizeVerifyStatusValue(currentVerificationStatus)
+    : '';
+  const serverStatus = sectionReviewState(me, section, me?.extra?.verification_status, verified);
+  // The latest server section state is authoritative. The form-level status is only
+  // an immediate fallback before the parent reload completes. This prevents an old
+  // local `pending` value from hiding an admin-approved `verified` state.
+  const rawStatus = ['pending', 'verified', 'rejected'].includes(serverStatus)
+    ? serverStatus
+    : (['pending', 'verified', 'rejected'].includes(currentFormStatus) ? currentFormStatus : serverStatus);
+  const pendingStorageKey = verificationPendingStorageKey(me, normalizedSectionName);
+  const fallbackPendingStorageKey = `w2w-verification-pending-current-${normalizedSectionName}`;
+  const pendingPayloadStorageKey = `${pendingStorageKey}-payload`;
+  let currentPayloadFingerprint = '';
+  try {
+    currentPayloadFingerprint = verificationPayloadFingerprint(payloadBuilder ? (payloadBuilder() || {}) : {});
+  } catch {}
+
+  // This explicit override is intentionally independent from the parent reload.
+  // It guarantees the clicked card changes immediately and cannot fall back to
+  // red while the production API/profile refresh is still catching up.
+  const [forcedStatus, setForcedStatus] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return (localStorage.getItem(pendingStorageKey) === '1' || localStorage.getItem(fallbackPendingStorageKey) === '1') ? 'pending' : '';
   });
+  const [submittedPayloadFingerprint, setSubmittedPayloadFingerprint] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    return localStorage.getItem(pendingPayloadStorageKey) || '';
+  });
+  const submittedValuesAreCurrent = !!submittedPayloadFingerprint && submittedPayloadFingerprint === currentPayloadFingerprint;
+
   useEffect(() => {
-    setLocalStatus((previous) => {
-      // Keep the submitted card yellow while production profile data catches up.
-      if (submittedLocally && previous === 'pending' && rawStatus === 'not_submitted') return previous;
-      return rawStatus;
-    });
-    if (rawStatus === 'pending' || rawStatus === 'verified' || rawStatus === 'rejected') {
-      setSubmittedLocally(false);
-      try { sessionStorage.removeItem(pendingStorageKey); } catch {}
+    if (rawStatus === 'verified') {
+      setForcedStatus('');
+      onStatusChange?.(normalizedSectionName, 'verified');
+      try {
+        localStorage.removeItem(pendingStorageKey);
+        localStorage.removeItem(fallbackPendingStorageKey);
+      } catch {}
+      return;
     }
-  }, [rawStatus, section, submittedLocally, pendingStorageKey]);
+    if (rawStatus === 'rejected') {
+      setForcedStatus('');
+      setSubmittedPayloadFingerprint('');
+      onStatusChange?.(normalizedSectionName, 'rejected');
+      try {
+        localStorage.removeItem(pendingStorageKey);
+        localStorage.removeItem(fallbackPendingStorageKey);
+        localStorage.removeItem(pendingPayloadStorageKey);
+      } catch {}
+      return;
+    }
+    if (rawStatus === 'pending') {
+      setForcedStatus('pending');
+      onStatusChange?.(normalizedSectionName, 'pending');
+      try {
+        localStorage.setItem(pendingStorageKey, '1');
+        localStorage.setItem(fallbackPendingStorageKey, '1');
+      } catch {}
+    }
+  }, [rawStatus, normalizedSectionName, onStatusChange, pendingStorageKey, fallbackPendingStorageKey, pendingPayloadStorageKey]);
+
+
   useEffect(() => {
-    const persistedPending = typeof window !== 'undefined' && sessionStorage.getItem(pendingStorageKey) === '1';
-    setSubmittedLocally(persistedPending);
-  }, [section, pendingStorageKey]);
-  // A successful submit must override the stale `modified` comparison until the
-  // parent profile state receives the saved database values. This makes the
-  // button turn yellow immediately without a refresh.
-  const status = submittedLocally ? 'pending' : modified ? 'modified' : localStatus;
+    if (!modified || submittedValuesAreCurrent) return;
+    // Once the worker changes this section, remove the old pending override so the
+    // button immediately becomes red and can be submitted again.
+    setForcedStatus('');
+    setSubmittedPayloadFingerprint('');
+    onStatusChange?.(normalizedSectionName, 'modified');
+    try {
+      localStorage.removeItem(pendingStorageKey);
+      localStorage.removeItem(fallbackPendingStorageKey);
+      localStorage.removeItem(pendingPayloadStorageKey);
+    } catch {}
+  }, [modified, submittedValuesAreCurrent, normalizedSectionName, onStatusChange, pendingStorageKey, fallbackPendingStorageKey, pendingPayloadStorageKey]);
+
+  // A real edit always wins over the previous pending/verified UI state. Only the
+  // edited card returns to Send for Verification. A just-submitted payload stays
+  // Pending Approval, and that same payload stays Done after admin approval,
+  // until the worker actually changes one of its values again.
+  const keepSuccessfulSubmissionPending = forcedStatus === 'pending' && submittedValuesAreCurrent;
+  const keepApprovedSubmissionDone = rawStatus === 'verified' && submittedValuesAreCurrent;
+  const status = modified && !keepSuccessfulSubmissionPending && !keepApprovedSubmissionDone
+    ? 'modified'
+    : (keepSuccessfulSubmissionPending ? 'pending' : (rawStatus === 'verified' ? 'verified' : (forcedStatus || rawStatus)));
   const label = status === 'verified' ? 'Done' : status === 'pending' ? 'Pending Approval' : 'Send for Verification';
   const Icon = status === 'verified' ? CheckCircle2 : status === 'pending' ? Clock : ShieldCheck;
   const blocked = !!disabled || status === 'pending' || status === 'verified';
@@ -6227,21 +6442,18 @@ function SectionVerificationAction({ token, me, section, title, description, col
       ? 'w2w-verify-button w2w-verify-pending bg-amber-500 text-white hover:bg-amber-600 disabled:bg-amber-500 disabled:text-white disabled:!opacity-100 disabled:cursor-default'
       : 'w2w-verify-button w2w-verify-idle !bg-rose-600 !text-white hover:!bg-rose-700 disabled:!bg-rose-600 disabled:!text-white disabled:!opacity-100 disabled:cursor-pointer';
   const actionStyle = status === 'verified'
-    ? { backgroundColor: '#16a34a', color: '#ffffff', borderColor: '#16a34a' }
+    ? { backgroundColor: '#16a34a', color: '#ffffff', borderColor: '#16a34a', opacity: 1 }
     : status === 'pending'
-      ? { backgroundColor: '#f59e0b', color: '#ffffff', borderColor: '#f59e0b' }
-      : { backgroundColor: '#dc2626', color: '#ffffff', borderColor: '#dc2626' };
+      ? { backgroundColor: '#f59e0b', color: '#ffffff', borderColor: '#f59e0b', opacity: 1 }
+      : { backgroundColor: '#dc2626', color: '#ffffff', borderColor: '#dc2626', opacity: 1 };
+
   const sendForReview = async () => {
     if (blocked || busy) return;
     setBusy(true);
     try {
       if (validate) {
         const validationMessage = validate();
-        if (validationMessage) {
-          toast.error(validationMessage);
-          setBusy(false);
-          return;
-        }
+        if (validationMessage) throw new Error(validationMessage);
       }
       const extraPayload = payloadBuilder ? (payloadBuilder() || {}) : {};
       const normalizedSection = normalizeVerifySectionName(section);
@@ -6249,27 +6461,40 @@ function SectionVerificationAction({ token, me, section, title, description, col
         ...extraPayload,
         verification_status: 'pending',
         verification_section: normalizedSection,
-        section_statuses: {
-          ...(me?.section_statuses || me?.extra?.section_statuses || {}),
-          [normalizedSection]: 'pending',
-          ...(normalizedSection === 'documents' ? { verification: 'pending' } : {}),
-        },
       };
-      await api('me/profile', { method: 'PATCH', token, body });
-      // Update the card instantly for both worker and employer dashboards.
-      // Keep this optimistic state until refreshed profile data confirms it.
-      setLocalStatus('pending');
-      setSubmittedLocally(true);
-      try { sessionStorage.setItem(pendingStorageKey, '1'); } catch {}
-      setForm?.((prev) => ({ ...prev, ...body, verification_status: 'pending', verification_section: normalizedSection }));
-      await onSaved?.();
+
+      const saved = await api('me/profile', { method: 'PATCH', token, body });
+      const savedSection = normalizeVerifySectionName(saved?.extra?.verification_section || normalizedSection);
+      const savedStatus = normalizeVerifyStatusValue(saved?.extra?.verification_status || 'pending');
+      if (savedStatus !== 'pending' || savedSection !== normalizedSection) {
+        throw new Error('Verification status was not saved. Please retry.');
+      }
+
+      // Change only this card immediately.
+      const submittedFingerprint = verificationPayloadFingerprint(extraPayload);
+      setSubmittedPayloadFingerprint(submittedFingerprint);
+      setForcedStatus('pending');
+      onStatusChange?.(normalizedSection, 'pending');
+      try {
+        localStorage.setItem(pendingStorageKey, '1');
+        localStorage.setItem(fallbackPendingStorageKey, '1');
+        localStorage.setItem(pendingPayloadStorageKey, submittedFingerprint);
+      } catch {}
+      setForm?.((prev) => ({
+        ...prev,
+        ...body,
+        verification_status: 'pending',
+        verification_section: normalizedSection,
+      }));
       toast.success(`${title} sent for admin verification`);
+      await onSaved?.();
     } catch (e) {
       toast.error(e.message || 'Unable to send verification');
     } finally {
       setBusy(false);
     }
   };
+
   return (
     <div className="flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between rounded-xl bg-slate-50 border p-3">
       <div>
@@ -6281,11 +6506,11 @@ function SectionVerificationAction({ token, me, section, title, description, col
         data-no-translate
         disabled={busy || blocked}
         onClick={sendForReview}
-        className={`${actionClass} min-w-[220px] h-12 rounded-2xl font-semibold transition-all duration-300 disabled:!opacity-100 disabled:cursor-not-allowed`}
+        className={`${actionClass} min-w-[220px] h-12 rounded-2xl font-semibold transition-all duration-300 disabled:!opacity-100 disabled:cursor-default whitespace-nowrap`}
         style={actionStyle}
       >
         {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Icon className="w-4 h-4 mr-2" />}
-        {label}
+        <span className="whitespace-nowrap">{label}</span>
       </Button>
     </div>
   );
@@ -6328,6 +6553,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
   const [subscriptionOpen, setSubscriptionOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
   const [finalSaved, setFinalSaved] = useState(false);
+  const [instantSectionStatuses, setInstantSectionStatuses] = useState({});
   const verified = !!me?.extra?.verified;
   const [subscriptionRefreshKey, setSubscriptionRefreshKey] = useState(0);
   const workerSubscription = useMemo(() => getSubscriptionFeatures('worker', me?.profile || me), [me, subscriptionRefreshKey]);
@@ -6348,11 +6574,24 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
     return () => window.removeEventListener('w2w-subscription-updated', refresh);
   }, []);
   const workerDraftKey = `w2w-worker-profile-draft-${me?.profile?.id || me?.id || 'me'}`;
+  const updateWorkerSectionStatus = useCallback((section, status) => {
+    const normalizedSection = normalizeVerifySectionName(section);
+    setInstantSectionStatuses((current) => (
+      current[normalizedSection] === status
+        ? current
+        : { ...current, [normalizedSection]: status }
+    ));
+  }, []);
 
   useEffect(() => {
     if (me) {
       let draft = {};
       try { draft = JSON.parse(localStorage.getItem(workerDraftKey) || '{}') || {}; } catch {}
+      const {
+        verification_status: _draftVerificationStatus,
+        verification_section: _draftVerificationSection,
+        ...draftFields
+      } = draft;
       setForm({
       full_name: me.profile?.full_name || '',
       phone: cleanIndianPhone10(me.profile?.phone) || '',
@@ -6398,9 +6637,10 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
       pan_image_url: me.extra?.pan_image_url || '',
       pan_back_url: me.extra?.pan_back_url || '',
       verification_status: me.extra?.verification_status || (me.extra?.verified ? 'verified' : 'not_submitted'),
+      verification_section: me.extra?.verification_section || '',
       verification_notes: me.extra?.verification_notes || '',
       language: me.profile?.language || 'en',
-      ...draft,
+      ...draftFields,
     });
     }
   }, [me]);
@@ -6472,17 +6712,35 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
     return '';
   };
 
-  const workerBankReviewStatus = sectionReviewState(me, 'bank', me?.extra?.verification_status, verified);
-  const workerBankChangedAfterReview = (workerBankReviewStatus === 'pending' || workerBankReviewStatus === 'verified') && hasBankDetailsChanged(buildWorkerBankPayload(), bankPayloadFromExtra(me?.extra || {}));
-  const workerProfileReviewStatus = sectionReviewState(me, 'profile', me?.extra?.verification_status, verified);
-  const workerProfileChangedAfterReview = (workerProfileReviewStatus === 'pending' || workerProfileReviewStatus === 'verified') && hasVerifySectionChanged(PROFILE_VERIFY_FIELDS, buildWorkerProfilePayload(), me?.profile || {}, me?.extra || {});
-  const workerDocumentReviewStatus = sectionReviewState(me, 'documents', me?.extra?.verification_status, verified);
-  const workerDocumentChangedAfterReview = (workerDocumentReviewStatus === 'pending' || workerDocumentReviewStatus === 'verified') && hasVerifySectionChanged(WORKER_DOCUMENT_VERIFY_FIELDS, buildWorkerDocumentPayload(), me?.profile || {}, me?.extra || {});
+  const workerFormReady = !!form && Object.keys(form).length > 0;
+  const workerBankServerReviewStatus = sectionReviewState(me, 'bank', me?.extra?.verification_status, verified);
+  const workerBankChangedAfterReview = workerFormReady && (workerBankServerReviewStatus === 'pending' || workerBankServerReviewStatus === 'verified') && hasBankDetailsChanged(buildWorkerBankPayload(), bankPayloadFromExtra(me?.extra || {}));
+  const workerProfileServerReviewStatus = sectionReviewState(me, 'profile', me?.extra?.verification_status, verified);
+  const workerProfileChangedAfterReview = workerFormReady && (workerProfileServerReviewStatus === 'pending' || workerProfileServerReviewStatus === 'verified') && hasVerifySectionChanged(PROFILE_VERIFY_FIELDS, buildWorkerProfilePayload(), me?.profile || {}, me?.extra || {});
+  const workerDocumentServerReviewStatus = sectionReviewState(me, 'documents', me?.extra?.verification_status, verified);
+  const workerDocumentChangedAfterReview = workerFormReady && (workerDocumentServerReviewStatus === 'pending' || workerDocumentServerReviewStatus === 'verified') && hasVerifySectionChanged(WORKER_DOCUMENT_VERIFY_FIELDS, buildWorkerDocumentPayload(), me?.profile || {}, me?.extra || {});
+  const workerBankReviewStatus = instantSectionStatuses.bank || workerBankServerReviewStatus;
+  const workerProfileReviewStatus = instantSectionStatuses.profile || workerProfileServerReviewStatus;
+  const workerDocumentReviewStatus = instantSectionStatuses.documents || workerDocumentServerReviewStatus;
+
+  useEffect(() => {
+    [
+      ['bank', workerBankServerReviewStatus],
+      ['profile', workerProfileServerReviewStatus],
+      ['documents', workerDocumentServerReviewStatus],
+    ].forEach(([section, status]) => {
+      if (['verified', 'pending', 'rejected'].includes(status)) {
+        updateWorkerSectionStatus(section, status);
+      }
+    });
+  }, [workerBankServerReviewStatus, workerProfileServerReviewStatus, workerDocumentServerReviewStatus, updateWorkerSectionStatus]);
+  const workerProfileApprovedPayloadCurrent = submittedVerificationPayloadMatches(me, 'profile', buildWorkerProfilePayload());
+  const workerBankApprovedPayloadCurrent = submittedVerificationPayloadMatches(me, 'bank', buildWorkerBankPayload());
   // Final Save button must follow the visible card status. If cards show Done/Verified, Save must work.
   // Do not block final Save because of stale local comparison data after admin approval or page refresh.
-  const workerProfileCardVerifiedForSave = workerProfileReviewStatus === 'verified' && !workerProfileChangedAfterReview;
+  const workerProfileCardVerifiedForSave = workerProfileReviewStatus === 'verified' && (!workerProfileChangedAfterReview || workerProfileApprovedPayloadCurrent);
   const workerDocumentCardVerifiedForSave = workerDocumentReviewStatus === 'verified' && !workerDocumentChangedAfterReview;
-  const workerBankCardVerifiedForSave = workerBankReviewStatus === 'verified' && !workerBankChangedAfterReview;
+  const workerBankCardVerifiedForSave = workerBankReviewStatus === 'verified' && (!workerBankChangedAfterReview || workerBankApprovedPayloadCurrent);
   const workerAllProfileCardsVerified = workerProfileCardVerifiedForSave && workerDocumentCardVerifiedForSave && workerBankCardVerifiedForSave;
   const workerAnyProfileCardPending = [workerProfileReviewStatus, workerDocumentReviewStatus, workerBankReviewStatus].some((s) => s === 'pending') && !(workerProfileChangedAfterReview || workerDocumentChangedAfterReview || workerBankChangedAfterReview);
   const workerTopStatus = workerAllProfileCardsVerified ? 'verified' : workerAnyProfileCardPending ? 'pending' : 'unverified';
@@ -6620,6 +6878,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
         form={form}
         setForm={setForm}
         onSaved={onSaved}
+        onStatusChange={updateWorkerSectionStatus}
         color="indigo"
       />
 
@@ -6668,6 +6927,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
             color="emerald"
             setForm={setForm}
             onSaved={onSaved}
+            onStatusChange={updateWorkerSectionStatus}
             disabled={(() => {
               return !(
                 String(form.account_holder_name || '').trim() &&
@@ -6764,7 +7024,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
               <CardContent className="p-4 space-y-4">
                 <div className="grid lg:grid-cols-2 gap-4 items-stretch">
                   <MobileOtpVerificationBox token={token} phone={form.phone} verified={!!me.extra?.mobile_verified} onVerified={(phone) => { setForm(f => ({ ...f, phone: phone || f.phone, mobile_verified: true })); onSaved?.(); }} />
-                  <SelfieVerificationBox token={token} url={form.selfie_url} frontUrl={form.selfie_front_url} leftUrl={form.selfie_left_url} rightUrl={form.selfie_right_url} verified={!!(me.extra?.selfie_verified || form.selfie_verified)} disabled={busy} onUploaded={(payload) => { setForm(f => ({ ...f, ...(typeof payload === 'string' ? { selfie_url: payload, selfie_verified: true } : payload), selfie_verified: true, verification_status: 'verified' })); onSaved?.(); }} />
+                  <SelfieVerificationBox token={token} url={form.selfie_url} frontUrl={form.selfie_front_url} leftUrl={form.selfie_left_url} rightUrl={form.selfie_right_url} verified={!!(me.extra?.selfie_verified || form.selfie_verified)} disabled={busy} onUploaded={(payload) => { setForm(f => ({ ...f, ...(typeof payload === 'string' ? { selfie_url: payload, selfie_verified: true } : payload), selfie_verified: true })); onSaved?.(); }} />
                 </div>
                 <div className="grid lg:grid-cols-1 gap-4 items-stretch">
                   <div className="rounded-2xl border bg-white p-4 min-h-[132px]">
@@ -6812,6 +7072,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
               color="indigo"
               setForm={setForm}
               onSaved={onSaved}
+              onStatusChange={updateWorkerSectionStatus}
               disabled={!String(form.full_name || '').trim() || !String(form.phone || '').trim()}
               validate={() => {
                 if (!String(form.full_name || '').trim()) return 'Enter full name';
@@ -6947,6 +7208,21 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
   const allowSelfieUpdate = !verified || changeMode;
   const capturedBlobRef = useRef(null);
   const autoCaptureLockRef = useRef(false);
+  const allowSelfieUpdateRef = useRef(!verified);
+  const busyRef = useRef(false);
+  const disabledRef = useRef(!!disabled);
+
+  useEffect(() => {
+    allowSelfieUpdateRef.current = !verified || changeMode;
+  }, [verified, changeMode]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
+    disabledRef.current = !!disabled;
+  }, [disabled]);
 
   useEffect(() => {
     setCapturedPreview(frontUrl || url || '');
@@ -6981,10 +7257,13 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
   };
 
   const captureFrontFace = async () => {
-    if (!videoRef.current || !canvasRef.current || !allowSelfieUpdate || busy || autoCaptureLockRef.current) return;
-    autoCaptureLockRef.current = true;
+    if (!videoRef.current || !canvasRef.current || !allowSelfieUpdateRef.current || busyRef.current || autoCaptureLockRef.current) return;
     const video = videoRef.current;
-    if (!video.videoWidth || !video.videoHeight) return;
+    if (!video.videoWidth || !video.videoHeight) {
+      setFaceMessage('Camera is still starting. Wait a moment and tap Capture again.');
+      return;
+    }
+    autoCaptureLockRef.current = true;
 
     const canvas = canvasRef.current;
     // Capture the real camera frame without zooming/cropping so the full face stays visible.
@@ -7078,7 +7357,7 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
         setFaceMessage('Auto detection is loading slowly. Keep your full front face visible and hold still...');
         let fallbackTicks = 0;
         scanTimerRef.current = setInterval(async () => {
-          if (!videoRef.current || capturedBlobRef.current || busy || autoCaptureLockRef.current) return;
+          if (!videoRef.current || capturedBlobRef.current || busyRef.current || autoCaptureLockRef.current) return;
           fallbackTicks += 1;
           setFaceMessage(fallbackTicks < 4 ? 'Keep full front face visible. Auto capturing soon...' : 'Capturing automatically...');
           if (fallbackTicks >= 5) {
@@ -7093,7 +7372,7 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
       scanTimerRef.current = setInterval(async () => {
         try {
           const video = videoRef.current;
-          if (!video || !video.videoWidth || !video.videoHeight || capturedBlobRef.current || busy || autoCaptureLockRef.current) return;
+          if (!video || !video.videoWidth || !video.videoHeight || capturedBlobRef.current || busyRef.current || autoCaptureLockRef.current) return;
           const faces = await readFaces(detectorPack, video);
           if (!faces || faces.length !== 1) {
             stableFaceCountRef.current = 0;
@@ -7159,35 +7438,63 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
     }
   };
 
+  const attachCameraStream = (stream, attempt = 0) => {
+    const waitMs = attempt === 0 ? 50 : 75;
+    setTimeout(async () => {
+      if (streamRef.current !== stream) return;
+      const video = videoRef.current;
+      if (!video) {
+        if (attempt < 12) {
+          attachCameraStream(stream, attempt + 1);
+          return;
+        }
+        setCameraError('Camera preview could not start. Close this window and try again.');
+        stopCamera();
+        return;
+      }
+
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      try {
+        await video.play();
+        setFaceMessage('Looking for one clear front human face...');
+        startFaceScan();
+      } catch {
+        setCameraError('Camera preview was blocked. Tap Start camera to retry.');
+      }
+    }, waitMs);
+  };
+
   const startCamera = async () => {
-    if (verified || busy) return;
+    if (!allowSelfieUpdateRef.current || busyRef.current || disabledRef.current) return;
     setCameraError('');
     resetAutoCapture();
+    stopCamera();
     try {
       if (!navigator?.mediaDevices?.getUserMedia) {
         setCameraError('Camera is not supported in this browser.');
         return;
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          aspectRatio: { ideal: 1.7777777778 },
-          frameRate: { ideal: 30 },
-        },
-        audio: false,
-      });
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'user' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            aspectRatio: { ideal: 1.7777777778 },
+            frameRate: { ideal: 30 },
+          },
+          audio: false,
+        });
+      } catch (preferredCameraError) {
+        if (!['OverconstrainedError', 'NotFoundError'].includes(preferredCameraError?.name)) throw preferredCameraError;
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
       streamRef.current = stream;
       setCameraOn(true);
-      setTimeout(async () => {
-        if (!videoRef.current) return;
-        videoRef.current.srcObject = stream;
-        videoRef.current.muted = true;
-        videoRef.current.playsInline = true;
-        try { await videoRef.current.play(); } catch {}
-        startFaceScan();
-      }, 80);
+      attachCameraStream(stream);
     } catch (e) {
       setCameraError('Camera permission denied or unavailable. Please allow camera access.');
       toast.error('Camera access failed');
@@ -7196,11 +7503,13 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
 
   const openVerification = () => {
     if (verified && !changeMode) return;
+    allowSelfieUpdateRef.current = true;
     setOpen(true);
     setTimeout(startCamera, 250);
   };
 
   const openSelfieChange = () => {
+    allowSelfieUpdateRef.current = true;
     setChangeMode(true);
     resetAutoCapture();
     setOpen(true);
@@ -7214,8 +7523,9 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
   };
 
   const submitFaceCheck = async () => {
-    if (!allowSelfieUpdate) return;
+    if (!allowSelfieUpdateRef.current || busyRef.current || disabledRef.current) return;
     if (!capturedBlob) return toast.error('Keep your front face in camera until auto capture completes.');
+    busyRef.current = true;
     setBusy(true);
     try {
       const file = new File([capturedBlob], `selfie-front-${Date.now()}.jpg`, { type: 'image/jpeg' });
@@ -7229,7 +7539,6 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
         // The image URL is still saved to the profile so admin can view it in dashboard.
         selfie_verified: true,
         selfie_verified_at: new Date().toISOString(),
-        verification_status: 'verified',
       };
       await api('me/profile', { method: 'PATCH', token, body: payload });
       onUploaded?.(payload);
@@ -7238,6 +7547,7 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
     } catch (e) {
       toast.error(e.message || 'Face verification upload failed');
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -7326,11 +7636,14 @@ function SelfieVerificationBox({ token, url, frontUrl, leftUrl, rightUrl, verifi
 
           <style>{`@keyframes selfieParticleMove { 0% { transform: translate3d(0, 0, 0); opacity: .18; } 50% { transform: translate3d(16px, -24px, 0); opacity: .65; } 100% { transform: translate3d(-8px, -52px, 0); opacity: .18; } } @keyframes selfieScan { 0% { transform: translateY(0); opacity:.45; } 50% { transform: translateY(370px); opacity:1; } 100% { transform: translateY(0); opacity:.45; } }`}</style>
 
-          <DialogFooter className="gap-2 sm:gap-2 shrink-0 !flex !flex-row !flex-nowrap items-center justify-between">
-            <Button type="button" variant="outline" className="flex-1 min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate} onClick={cameraOn ? stopCamera : startCamera}>{cameraOn ? 'Stop camera' : 'Start camera'}</Button>
-            <Button type="button" variant="outline" className="flex-1 min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate || cameraOn} onClick={startCamera}>Retake</Button>
-            <Button type="button" className="flex-1 min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" disabled={busy || disabled || !allowSelfieUpdate || !capturedBlob} onClick={submitFaceCheck}>{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Submit'}</Button>
-          </DialogFooter>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 shrink-0">
+            <Button type="button" variant="outline" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate} onClick={cameraOn ? stopCamera : startCamera}>{cameraOn ? 'Stop camera' : 'Start camera'}</Button>
+            <Button type="button" variant="outline" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate || !cameraOn} onClick={captureFrontFace}>
+              <Camera className="w-4 h-4 mr-1.5" /> Capture
+            </Button>
+            <Button type="button" variant="outline" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap" disabled={busy || disabled || !allowSelfieUpdate || cameraOn} onClick={startCamera}>Retake</Button>
+            <Button type="button" className="min-w-0 px-2 text-xs sm:text-sm whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 text-white disabled:bg-emerald-600 disabled:text-white disabled:opacity-100" disabled={busy || disabled || !allowSelfieUpdate || !capturedBlob} onClick={submitFaceCheck}>{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Submit'}</Button>
+          </div>
         </DialogContent>
       </Dialog>
     </div>
@@ -7646,6 +7959,11 @@ function EmployerApp({ auth, onLogout }) {
     catch (e) { toast.error(e.message); }
   };
   useEffect(() => { if (token) { refreshMe(); refreshJobs(); } }, [token]);
+  useEffect(() => {
+    if (!token || tab !== 'profile') return undefined;
+    const timer = setInterval(() => refreshMe(), 4000);
+    return () => clearInterval(timer);
+  }, [token, tab]);
 
   useEffect(() => {
     if (!me?.profile?.id || !token) return;
@@ -9352,6 +9670,15 @@ const [busy,setBusy]=useState(false);
   const [subscriptionOpen, setSubscriptionOpen] = useState(false);
   const [supportOpen, setSupportOpen] = useState(false);
   const [finalSaved, setFinalSaved] = useState(false);
+  const [instantSectionStatuses, setInstantSectionStatuses] = useState({});
+  const updateEmployerSectionStatus = useCallback((section, status) => {
+    const normalizedSection = normalizeVerifySectionName(section);
+    setInstantSectionStatuses((current) => (
+      current[normalizedSection] === status
+        ? current
+        : { ...current, [normalizedSection]: status }
+    ));
+  }, []);
 
 const [savedData,setSavedData]=useState({});
 const [hasChanges,setHasChanges]=useState(false);
@@ -9397,6 +9724,7 @@ selfie_right_url: employerExtra.selfie_right_url || '',
 selfie_verified: !!employerExtra.selfie_verified,
 selfie_verified_at: employerExtra.selfie_verified_at || '',
 verification_status: employerExtra.verification_status || (employerExtra.verified ? 'verified' : 'not_submitted'),
+verification_section: employerExtra.verification_section || '',
 language:employerProfile.language || 'en'
 
 };
@@ -9561,10 +9889,23 @@ useEffect(() => {
     return '';
   };
 
-  const employerProfileReviewStatus = sectionReviewState(me, 'profile', me?.extra?.verification_status, !!employerExtra.verified);
-  const employerProfileChangedAfterReview = (employerProfileReviewStatus === 'pending' || employerProfileReviewStatus === 'verified') && hasVerifySectionChanged(EMPLOYER_PROFILE_VERIFY_FIELDS, buildEmployerProfilePayload(), me?.profile || {}, me?.extra || {});
-  const employerDocumentReviewStatus = sectionReviewState(me, 'documents', me?.extra?.verification_status, !!employerExtra.verified);
-  const employerDocumentChangedAfterReview = (employerDocumentReviewStatus === 'pending' || employerDocumentReviewStatus === 'verified') && hasVerifySectionChanged(EMPLOYER_DOCUMENT_VERIFY_FIELDS, buildEmployerDocumentPayload(), me?.profile || {}, me?.extra || {});
+  const employerProfileServerReviewStatus = sectionReviewState(me, 'profile', me?.extra?.verification_status, !!employerExtra.verified);
+  const employerProfileChangedAfterReview = (employerProfileServerReviewStatus === 'pending' || employerProfileServerReviewStatus === 'verified') && hasVerifySectionChanged(EMPLOYER_PROFILE_VERIFY_FIELDS, buildEmployerProfilePayload(), me?.profile || {}, me?.extra || {});
+  const employerDocumentServerReviewStatus = sectionReviewState(me, 'documents', me?.extra?.verification_status, !!employerExtra.verified);
+  const employerDocumentChangedAfterReview = (employerDocumentServerReviewStatus === 'pending' || employerDocumentServerReviewStatus === 'verified') && hasVerifySectionChanged(EMPLOYER_DOCUMENT_VERIFY_FIELDS, buildEmployerDocumentPayload(), me?.profile || {}, me?.extra || {});
+  const employerProfileRawStatus = instantSectionStatuses.profile || employerProfileServerReviewStatus;
+  const employerDocumentRawStatus = instantSectionStatuses.documents || employerDocumentServerReviewStatus;
+
+  useEffect(() => {
+    [
+      ['profile', employerProfileServerReviewStatus],
+      ['documents', employerDocumentServerReviewStatus],
+    ].forEach(([section, status]) => {
+      if (['verified', 'pending', 'rejected'].includes(status)) {
+        updateEmployerSectionStatus(section, status);
+      }
+    });
+  }, [employerProfileServerReviewStatus, employerDocumentServerReviewStatus, updateEmployerSectionStatus]);
 
   // Employer final save follows the working employee profile pattern, without removed employer bank/mobile checks.
   // Required cards: Company/Profile approval + Documents approval + Selfie verified.
@@ -9576,12 +9917,11 @@ useEffect(() => {
     me?.extra?.selfie_status === 'verified' ||
     me?.extra?.selfie_verification_status === 'verified'
   );
-  const employerProfileRawStatus = sectionReviewState(me, 'profile', me?.extra?.verification_status, !!employerExtra.verified);
-  const employerDocumentRawStatus = sectionReviewState(me, 'documents', me?.extra?.verification_status, !!employerExtra.verified);
   const employerGloballyVerified = !!me?.extra?.verified && me?.extra?.verification_status === 'verified';
+  const employerProfileApprovedPayloadCurrent = submittedVerificationPayloadMatches(me, 'profile', buildEmployerProfilePayload());
   // Final Save button must follow the visible card status. If cards show Done/Verified, Save must work.
   // Do not block final Save because of stale local comparison data after admin approval or page refresh.
-  const employerProfileCardVerified = (employerProfileRawStatus === 'verified' || employerGloballyVerified) && !employerProfileChangedAfterReview;
+  const employerProfileCardVerified = (employerProfileRawStatus === 'verified' || employerGloballyVerified) && (!employerProfileChangedAfterReview || employerProfileApprovedPayloadCurrent);
   const employerDocumentCardVerified = (employerDocumentRawStatus === 'verified' || employerGloballyVerified) && !employerDocumentChangedAfterReview;
   const employerAllProfileCardsVerified = employerProfileCardVerified && employerDocumentCardVerified && employerSelfieCardVerified;
   const employerAnyProfileCardPending = [employerProfileRawStatus, employerDocumentRawStatus].some((s) => s === 'pending') && !(employerProfileChangedAfterReview || employerDocumentChangedAfterReview);
@@ -9751,6 +10091,7 @@ useEffect(() => {
         form={f}
         setForm={setF}
         onSaved={onSaved}
+        onStatusChange={updateEmployerSectionStatus}
         color="emerald"
       />
 
@@ -9806,7 +10147,7 @@ useEffect(() => {
               </CardHeader>
               <CardContent className="p-4 grid lg:grid-cols-2 gap-4 items-stretch">
                 <MobileOtpVerificationBox token={token} phone={f.phone} verified={!!employerExtra.mobile_verified} onVerified={(phone) => { setF(s => ({ ...s, phone: phone || s.phone, mobile_verified: true })); onSaved?.(); }} />
-                <SelfieVerificationBox token={token} url={f.selfie_url || employerExtra.selfie_url} frontUrl={f.selfie_front_url || employerExtra.selfie_front_url} leftUrl={f.selfie_left_url || employerExtra.selfie_left_url} rightUrl={f.selfie_right_url || employerExtra.selfie_right_url} verified={!!(f.selfie_verified || employerExtra.selfie_verified)} disabled={busy} onUploaded={(payload) => { const uploadedUrl = typeof payload === 'string' ? payload : (payload?.selfie_url || payload?.selfie_front_url || payload?.url || ''); const nextSelfie = { ...(typeof payload === 'object' && payload ? payload : {}), selfie_url: uploadedUrl, selfie_front_url: uploadedUrl || (typeof payload === 'object' ? payload?.selfie_front_url : ''), selfie_verified: true, selfie_verified_at: (typeof payload === 'object' && payload?.selfie_verified_at) ? payload.selfie_verified_at : new Date().toISOString(), verification_status: 'verified' }; setF(s => ({ ...s, ...nextSelfie })); setSavedData(s => ({ ...s, ...nextSelfie })); setFinalSaved(false); onSaved?.(); }} />
+                <SelfieVerificationBox token={token} url={f.selfie_url || employerExtra.selfie_url} frontUrl={f.selfie_front_url || employerExtra.selfie_front_url} leftUrl={f.selfie_left_url || employerExtra.selfie_left_url} rightUrl={f.selfie_right_url || employerExtra.selfie_right_url} verified={!!(f.selfie_verified || employerExtra.selfie_verified)} disabled={busy} onUploaded={(payload) => { const uploadedUrl = typeof payload === 'string' ? payload : (payload?.selfie_url || payload?.selfie_front_url || payload?.url || ''); const nextSelfie = { ...(typeof payload === 'object' && payload ? payload : {}), selfie_url: uploadedUrl, selfie_front_url: uploadedUrl || (typeof payload === 'object' ? payload?.selfie_front_url : ''), selfie_verified: true, selfie_verified_at: (typeof payload === 'object' && payload?.selfie_verified_at) ? payload.selfie_verified_at : new Date().toISOString() }; setF(s => ({ ...s, ...nextSelfie })); setSavedData(s => ({ ...s, ...nextSelfie })); setFinalSaved(false); onSaved?.(); }} />
               </CardContent>
             </Card>
           </div>
@@ -9820,6 +10161,7 @@ useEffect(() => {
               color="emerald"
               setForm={setF}
               onSaved={onSaved}
+              onStatusChange={updateEmployerSectionStatus}
               disabled={busy}
               validate={requireEmployerProfile}
               payloadBuilder={buildEmployerProfilePayload}

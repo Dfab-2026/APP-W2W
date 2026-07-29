@@ -1338,3 +1338,25 @@ textarea::placeholder, input::placeholder {
 .saved-location-card [class*="absolute"][class*="top-"] {
   z-index: 99999 !important;
 }
+
+
+/* Admin panel alignment and single-line action controls */
+.w2w-admin-panel button,
+.w2w-admin-panel [role="button"],
+.w2w-admin-panel th,
+.w2w-admin-panel .admin-action-label {
+  white-space: nowrap;
+}
+.w2w-admin-panel table th,
+.w2w-admin-panel table td {
+  vertical-align: middle;
+}
+.w2w-admin-panel table td {
+  overflow-wrap: anywhere;
+}
+.w2w-admin-panel table td:last-child {
+  overflow-wrap: normal;
+}
+.w2w-admin-panel [data-radix-dialog-content] button {
+  flex-shrink: 0;
+}
