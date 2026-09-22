@@ -511,6 +511,7 @@ async function resolveCurrentAccessToken(preferredToken = null) {
 }
 
 async function api(path, { method = 'GET', body, token } = {}) {
+  const isAuthEntryRequest = String(path || '').startsWith('auth/');
   const makeRequest = async (accessToken) => {
     const headers = { 'Content-Type': 'application/json' };
     if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
@@ -529,7 +530,7 @@ async function api(path, { method = 'GET', body, token } = {}) {
   let accessToken = await resolveCurrentAccessToken(token || null);
   let res = await makeRequest(accessToken);
 
-  if (res.status === 401) {
+  if (res.status === 401 && !isAuthEntryRequest) {
     const refreshedToken = await getFreshAccessToken(null);
     if (refreshedToken && refreshedToken !== accessToken) {
       accessToken = refreshedToken;
@@ -540,7 +541,7 @@ async function api(path, { method = 'GET', body, token } = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message = data.error || `Request failed (${res.status})`;
-    if (res.status === 401 || /unauthorized|jwt|token|session/i.test(message)) {
+    if (!isAuthEntryRequest && (res.status === 401 || /unauthorized|jwt|token|session/i.test(message))) {
       handleAuthFailureOnce();
       const error = new Error('Session expired. Please sign in again.');
       error.code = 'AUTH_REQUIRED';
@@ -1290,9 +1291,30 @@ export default function App() {
 
   useEffect(() => {
     let expiryHandled = false;
-    const onExpired = () => {
+    const onExpired = async () => {
       if (expiryHandled) return;
       expiryHandled = true;
+
+      // Recover a saved signed-in session before sending the user back to login.
+      // This prevents a temporary 401 from removing a valid persisted login.
+      const saved = loadSession();
+      if (saved?.session?.access_token && saved?.session?.refresh_token && saved?.role) {
+        try {
+          const { data, error } = await getSupabase().auth.setSession({
+            access_token: saved.session.access_token,
+            refresh_token: saved.session.refresh_token,
+          });
+          if (!error && data?.session?.access_token) {
+            const recovered = { session: data.session, role: saved.role, profile: saved.profile || {} };
+            saveSession(recovered.session, recovered.role, recovered.profile);
+            setAuth(recovered);
+            setScreenState(dashboardScreenForRole(recovered.role));
+            expiryHandled = false;
+            return;
+          }
+        } catch {}
+      }
+
       clearSession();
       setAuth(null);
       setScreenState('login');
@@ -1329,24 +1351,27 @@ export default function App() {
     setScreen('login');
   };
 
-  const handleAuthed = async (data) => {
-    let session = data.session;
-    try {
-      if (session?.access_token && session?.refresh_token) {
-        const { data: restored, error } = await getSupabase().auth.setSession({
-          access_token: session.access_token,
-          refresh_token: session.refresh_token,
-        });
-        if (!error && restored?.session) session = restored.session;
-      }
-    } catch {}
-
-    const payload = { session, role: data.role, profile: data.profile || data.user };
+  const handleAuthed = (data) => {
+    const payload = { session: data.session, role: data.role, profile: data.profile || data.user };
     saveSession(payload.session, payload.role, payload.profile);
     setAuth(payload);
     setScreenState(dashboardScreenForRole(data.role));
     setTimeout(() => enableDeviceNotifications(payload.session?.access_token).catch(() => {}), 600);
     toast.success('Welcome to Work2Wish!');
+
+    // Sync the returned session with Supabase in the background. Dashboard
+    // navigation must not wait for this network/storage operation.
+    if (payload.session?.access_token && payload.session?.refresh_token) {
+      getSupabase().auth.setSession({
+        access_token: payload.session.access_token,
+        refresh_token: payload.session.refresh_token,
+      }).then(({ data: restored, error }) => {
+        if (error || !restored?.session) return;
+        const synced = { ...payload, session: restored.session };
+        saveSession(synced.session, synced.role, synced.profile);
+        setAuth(synced);
+      }).catch(() => {});
+    }
   };
 
   // -- helper for OAuth role pick
@@ -2334,9 +2359,40 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
     setMobileBusy(true);
     try {
       const supa = getSupabase();
+
+      // Mobile signup/login already stores the authenticated session locally.
+      // Restore that session first so this button behaves like Google sign-in
+      // and opens the dashboard without asking for the credentials again.
+      const saved = loadSession();
+      if (saved?.role && saved?.profile?.phone && saved?.session?.access_token) {
+        let restoredSession = null;
+        if (saved.session.refresh_token) {
+          const { data: restored, error } = await supa.auth.setSession({
+            access_token: saved.session.access_token,
+            refresh_token: saved.session.refresh_token,
+          });
+          if (!error) restoredSession = restored?.session || null;
+        } else if (isJwtUsable(saved.session.access_token, 0)) {
+          restoredSession = saved.session;
+        }
+
+        if (restoredSession?.access_token) {
+          onAuthed({ session: restoredSession, role: saved.role, profile: saved.profile });
+          return;
+        }
+      }
+
       const { data } = await supa.auth.getSession();
       const activeSession = data?.session;
       if (activeSession?.access_token) {
+        if (
+          saved?.role &&
+          saved?.profile?.phone &&
+          (!saved.profile.id || saved.profile.id === activeSession.user?.id)
+        ) {
+          onAuthed({ session: activeSession, role: saved.role, profile: saved.profile });
+          return;
+        }
         const fin = await api('auth/oauth-finalize', {
           method: 'POST',
           body: { access_token: activeSession.access_token },
