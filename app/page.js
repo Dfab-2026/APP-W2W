@@ -12,7 +12,7 @@ import {
   Mail, KeyRound, Hash, Copy, Eye, EyeOff, Lock, ShieldAlert, X,
   FileText, Tag, IndianRupee, Calendar, Award, Check, UserCircle, Sun, Moon, Globe2, Languages, Trash2, CheckCheck, Save
 } from 'lucide-react';
-import { toast } from 'sonner';
+import { toast as sonnerToast } from 'sonner';
 import { createPortal } from 'react-dom';
 
 import { Button } from '@/components/ui/button';
@@ -31,6 +31,16 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { InputOTP, InputOTPGroup, InputOTPSlot } from '@/components/ui/input-otp';
 
 import { getSupabase } from '@/lib/supabase/client';
+
+const shouldHideSessionNotice = (message) =>
+  /session\s+(?:is\s+not\s+ready|not\s+ready|expired)|please\s+(?:sign|log)\s*in\s+again/i.test(String(message || ''));
+
+const toast = {
+  error: (message, options) => shouldHideSessionNotice(message) ? undefined : sonnerToast.error(message, options),
+  success: (...args) => sonnerToast.success(...args),
+  info: (...args) => sonnerToast.info(...args),
+  message: (...args) => sonnerToast.message(...args),
+};
 
 
 function Work2WishLogo({ className = 'w-10 h-10', imgClassName = 'w-full h-full object-contain rounded-xl' }) {
@@ -1159,7 +1169,7 @@ export default function App() {
   const [screen, setScreenState] = useState('splash');
   const [navigationHistory, setNavigationHistory] = useState([]); // Track previous screens
   const [auth, setAuth] = useState(null);
-  const [signup, setSignup] = useState({ role: null, full_name: '', email: '', password: '', confirm_password: '' });
+  const [signup, setSignup] = useState({ role: null, full_name: '', auth_method: 'email', email: '', phone: '', password: '', confirm_password: '' });
   const [oauthCtx, setOauthCtx] = useState(null);
   const [forgotEmail, setForgotEmail] = useState('');
   const [language, setLanguage] = useState('en'); // en, hi, etc.
@@ -1248,7 +1258,9 @@ export default function App() {
             setSignup({
               role: null,
               full_name: fin.full_name || '',
+              auth_method: 'email',
               email: fin.email || '',
+              phone: '',
               password: '',
               confirm_password: '',
               is_google_signup: true,
@@ -1284,7 +1296,6 @@ export default function App() {
       clearSession();
       setAuth(null);
       setScreenState('login');
-      toast.error('Session expired. Please sign in again.', { id: 'w2w-session-expired' });
       window.setTimeout(() => { expiryHandled = false; }, 5000);
     };
     window.addEventListener('w2w-session-expired', onExpired);
@@ -1314,7 +1325,7 @@ export default function App() {
     try { await getSupabase().auth.signOut(); } catch {}
     clearSession();
     setAuth(null);
-    setSignup({ role: null, full_name: '', email: '', password: '', confirm_password: '' });
+    setSignup({ role: null, full_name: '', auth_method: 'email', email: '', phone: '', password: '', confirm_password: '' });
     setScreen('login');
   };
 
@@ -1548,15 +1559,6 @@ function AdminApp({ auth, onLogout }) {
   };
 
   useEffect(() => { loadUsers(); }, [token, roleFilter, statusFilter]);
-
-  // Keep admin panel fresh when users submit verification from another tab/device.
-  useEffect(() => {
-    if (!token) return;
-    const t = setInterval(() => {
-      loadUsers();
-    }, 8000);
-    return () => clearInterval(t);
-  }, [token, roleFilter, statusFilter]);
 
   const openDetails = async (user) => {
     setSelected(user);
@@ -2301,15 +2303,55 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [googleTermsAccepted, setGoogleTermsAccepted] = useState(false);
+  const [loginMethod, setLoginMethod] = useState('email');
+  const [mobileBusy, setMobileBusy] = useState(false);
 
   const submit = async (e) => {
     e.preventDefault();
-    if (!identifier || !password) return toast.error('Enter email/login ID and password');
+    const loginIdentifier = loginMethod === 'phone' ? normalizeIndianMobile(identifier) : identifier.trim();
+    if (!loginIdentifier || !password) {
+      return toast.error(loginMethod === 'phone' ? 'Enter mobile number and password' : 'Enter email/login ID and password');
+    }
     setBusy(true);
     try {
-      const data = await api('auth/login', { method: 'POST', body: { identifier, password } });
+      const data = await api('auth/login', {
+        method: 'POST',
+        body: { identifier: loginIdentifier, password, login_method: loginMethod },
+      });
       onAuthed(data);
     } catch (e) { toast.error(e.message); } finally { setBusy(false); }
+  };
+
+  const showMobileLogin = () => {
+    if (loginMethod !== 'phone') {
+      setIdentifier('');
+      setPassword('');
+    }
+    setLoginMethod('phone');
+  };
+
+  const continueWithMobile = async () => {
+    setMobileBusy(true);
+    try {
+      const supa = getSupabase();
+      const { data } = await supa.auth.getSession();
+      const activeSession = data?.session;
+      if (activeSession?.access_token) {
+        const fin = await api('auth/oauth-finalize', {
+          method: 'POST',
+          body: { access_token: activeSession.access_token },
+        });
+        if (fin?.profile?.phone && fin?.role) {
+          onAuthed({ session: activeSession, role: fin.role, profile: fin.profile });
+          return;
+        }
+      }
+      showMobileLogin();
+    } catch {
+      showMobileLogin();
+    } finally {
+      setMobileBusy(false);
+    }
   };
 
   const google = async () => {
@@ -2420,6 +2462,19 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
             </Button>
           </motion.div>
 
+          <motion.div whileHover={{ y: -2 }} whileTap={{ scale: 0.99 }}>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full h-10 sm:h-12 mt-2 transition-shadow text-sm hover:shadow-md"
+              onClick={continueWithMobile}
+              disabled={mobileBusy}
+            >
+              {mobileBusy ? <Loader2 className="w-5 h-5 mr-2 animate-spin" /> : <Phone className="w-5 h-5 mr-2" />}
+              Continue with Mobile
+            </Button>
+          </motion.div>
+
           <div className="flex items-center gap-3 my-3 sm:my-6">
             <Separator className="flex-1" />
             <span className="text-xs text-muted-foreground">OR</span>
@@ -2428,18 +2483,38 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
 
           <form onSubmit={submit} className="space-y-2 sm:space-y-3">
             <div>
-              <Label>Email or Login ID</Label>
+              <Label>{loginMethod === 'phone' ? 'Mobile number' : 'Email or Login ID'}</Label>
               <div className="relative">
-                <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                <Input className="pl-9" value={identifier} onChange={e => setIdentifier(e.target.value)} placeholder="you@example.com or 234812" autoComplete="username" />
+                {loginMethod === 'phone' ? (
+                  <>
+                    <Phone className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                    <span className="absolute left-9 top-1/2 -translate-y-1/2 text-sm text-slate-600">+91</span>
+                    <Input
+                      className="pl-[4.25rem]"
+                      value={cleanIndianPhone10(identifier)}
+                      onChange={e => setIdentifier(cleanIndianPhone10(e.target.value))}
+                      placeholder="9876543210"
+                      inputMode="numeric"
+                      maxLength={10}
+                      autoComplete="tel"
+                    />
+                  </>
+                ) : (
+                  <>
+                    <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                    <Input className="pl-9" value={identifier} onChange={e => setIdentifier(e.target.value)} placeholder="you@example.com or 234812" autoComplete="username" />
+                  </>
+                )}
               </div>
             </div>
             <div>
               <div className="flex items-center justify-between">
                 <Label>Password</Label>
-                <button type="button" onClick={onGotoForgot} className="text-xs text-indigo-600 hover:underline font-medium">
-                  Forgot password?
-                </button>
+                {loginMethod === 'email' && (
+                  <button type="button" onClick={onGotoForgot} className="text-xs text-indigo-600 hover:underline font-medium">
+                    Forgot password?
+                  </button>
+                )}
               </div>
               <PasswordInput value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" />
             </div>
@@ -2652,9 +2727,12 @@ function getPasswordStrength(password = '') {
 
 function SignupForm({ data, onChange, onSent, onBack }) {
   const [busy, setBusy] = useState(false);
+  const isPhoneSignup = data.auth_method === 'phone' && !data.is_google_signup;
   const submit = async (e) => {
     e.preventDefault();
-    if (!data.full_name || !data.email || !data.password || !data.confirm_password) return toast.error('Fill all fields');
+    const contact = isPhoneSignup ? normalizeIndianMobile(data.phone) : data.email?.trim();
+    if (!data.full_name || !contact || !data.password || !data.confirm_password) return toast.error('Fill all fields');
+    if (isPhoneSignup && !isValidIndianPhone10(data.phone)) return toast.error('Enter a valid 10-digit mobile number');
     if (data.password.length < 6) return toast.error('Password must be at least 6 characters');
     if (getPasswordStrength(data.password).label === 'Weak') return toast.error('Use a stronger password');
     if (data.password !== data.confirm_password) return toast.error('Passwords do not match');
@@ -2662,9 +2740,9 @@ function SignupForm({ data, onChange, onSent, onBack }) {
     try {
       await api(
         data.is_google_signup ? 'auth/google-send-otp' : 'auth/send-otp',
-        { method: 'POST', body: data }
+        { method: 'POST', body: isPhoneSignup ? { ...data, phone: contact } : data }
       );
-      toast.success(`OTP sent to ${data.email}`);
+      toast.success(`OTP sent to ${isPhoneSignup ? contact : data.email}`);
       onSent();
     } catch (e) { toast.error(e.message); } finally { setBusy(false); }
   };
@@ -2690,6 +2768,24 @@ function SignupForm({ data, onChange, onSent, onBack }) {
           </CardHeader>
           <CardContent>
             <form onSubmit={submit} className="space-y-2 sm:space-y-3">
+              {!data.is_google_signup && (
+                <div className="grid grid-cols-2 rounded-xl bg-slate-100 p-1">
+                  <button
+                    type="button"
+                    onClick={() => onChange({ auth_method: 'email', phone: '' })}
+                    className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${!isPhoneSignup ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                  >
+                    <Mail className="mr-1.5 inline h-4 w-4" /> Email
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChange({ auth_method: 'phone', email: '' })}
+                    className={`rounded-lg px-3 py-2 text-sm font-semibold transition ${isPhoneSignup ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                  >
+                    <Phone className="mr-1.5 inline h-4 w-4" /> Mobile
+                  </button>
+                </div>
+              )}
               <div>
                 <Label>Full name</Label>
                 <Input
@@ -2701,17 +2797,35 @@ function SignupForm({ data, onChange, onSent, onBack }) {
                 />
               </div>
               <div>
-                <Label>Email</Label>
+                <Label>{isPhoneSignup ? 'Mobile number' : 'Email'}</Label>
                 <div className="relative">
-                  <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    type="email"
-                    className={`pl-9 ${data.is_google_signup ? 'bg-slate-100 cursor-not-allowed' : ''}`}
-                    value={data.email}
-                    disabled={data.is_google_signup}
-                    onChange={e => onChange({ email: e.target.value })}
-                    placeholder="you@example.com"
-                  />
+                  {isPhoneSignup ? (
+                    <>
+                      <Phone className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                      <span className="absolute left-9 top-1/2 -translate-y-1/2 text-sm text-slate-600">+91</span>
+                      <Input
+                        className="pl-[4.25rem]"
+                        value={cleanIndianPhone10(data.phone)}
+                        onChange={e => onChange({ phone: cleanIndianPhone10(e.target.value) })}
+                        placeholder="9876543210"
+                        inputMode="numeric"
+                        maxLength={10}
+                        autoComplete="tel"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        type="email"
+                        className={`pl-9 ${data.is_google_signup ? 'bg-slate-100 cursor-not-allowed' : ''}`}
+                        value={data.email}
+                        disabled={data.is_google_signup}
+                        onChange={e => onChange({ email: e.target.value })}
+                        placeholder="you@example.com"
+                      />
+                    </>
+                  )}
                 </div>
               </div>
               <div>
@@ -2747,7 +2861,7 @@ function SignupForm({ data, onChange, onSent, onBack }) {
                       className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <>Send OTP <Send className="w-4 h-4 ml-2" /></>}
               </Button>
-              <p className="text-xs text-muted-foreground text-center">A 6-digit code will be sent to your email.</p>
+              <p className="text-xs text-muted-foreground text-center">A 6-digit code will be sent to your {isPhoneSignup ? 'mobile number' : 'email'}.</p>
             </form>
           </CardContent>
         </Card>
@@ -2764,6 +2878,8 @@ function SignupOTP({ data, onAuthed, onBack }) {
   const [busy, setBusy] = useState(false);
   const [resending, setResending] = useState(false);
   const [secondsLeft, setSecondsLeft] = useState(60);
+  const isPhoneSignup = data.auth_method === 'phone' && !data.is_google_signup;
+  const otpDestination = isPhoneSignup ? normalizeIndianMobile(data.phone) : data.email;
 
   useEffect(() => {
     if (secondsLeft <= 0) return;
@@ -2781,7 +2897,9 @@ function SignupOTP({ data, onAuthed, onBack }) {
           method: 'POST',
           body: data.is_google_signup
             ? { email: data.email, otp: code, google_access_token: data.google_access_token }
-            : { email: data.email, otp: code },
+            : isPhoneSignup
+              ? { phone: otpDestination, otp: code, auth_method: 'phone' }
+              : { email: data.email, otp: code, auth_method: 'email' },
         }
       );
       onAuthed(d);
@@ -2790,7 +2908,12 @@ function SignupOTP({ data, onAuthed, onBack }) {
   const resend = async () => {
     setResending(true);
     try {
-      await api('auth/resend-otp', { method: 'POST', body: { email: data.email } });
+      await api('auth/resend-otp', {
+        method: 'POST',
+        body: isPhoneSignup
+          ? { phone: otpDestination, auth_method: 'phone' }
+          : { email: data.email, auth_method: 'email' },
+      });
       toast.success('Sent a new code');
       setSecondsLeft(60); setCode('');
     } catch (e) { toast.error(e.message); } finally { setResending(false); }
@@ -2809,10 +2932,10 @@ function SignupOTP({ data, onAuthed, onBack }) {
               accent === 'emerald' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]'
             }`}
               animate={{ scale: [1, 1.05, 1] }} transition={{ duration: 2, repeat: Infinity }}>
-              <Mail className="w-7 h-7" />
+              {isPhoneSignup ? <Phone className="w-7 h-7" /> : <Mail className="w-7 h-7" />}
             </motion.div>
-            <CardTitle className="text-2xl">Verify your email</CardTitle>
-            <CardDescription>We sent a 6-digit code to <b>{data.email}</b></CardDescription>
+            <CardTitle className="text-2xl">Verify your {isPhoneSignup ? 'mobile' : 'email'}</CardTitle>
+            <CardDescription>We sent a 6-digit code to <b>{otpDestination}</b></CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="flex justify-center">

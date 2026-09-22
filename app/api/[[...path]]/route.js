@@ -418,6 +418,12 @@ function normalizePhone(phone) {
   return null;
 }
 
+function mobileAuthEmail(phone) {
+  const normalized = normalizePhone(phone);
+  if (!normalized) return null;
+  return `mobile-${normalized.replace(/\D/g, '')}@auth.work2wish.com`;
+}
+
 async function sendSmsOtp(phone, code) {
   const cleanPhone = String(phone).replace(/\D/g, '');
 
@@ -578,9 +584,33 @@ async function route(request, { params }) {
     // ---------- AUTH ----------
     // STEP 1: send OTP. We hold the pending signup data in otp_codes.payload.
     if (path === 'auth/send-otp' && method === 'POST') {
-      const { email, password, role, full_name } = await request.json();
-      if (!email || !password || !role) return err('email, password, role required', 400);
+      const body = await request.json();
+      const { email, password, role, full_name } = body;
+      const isPhoneSignup = body.auth_method === 'phone';
       if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
+
+      if (isPhoneSignup) {
+        const phone = normalizePhone(String(body.phone || '').trim());
+        if (!phone || !password || !role) return err('phone, password, role required', 400);
+
+        const { data: existing } = await admin.from('user_profiles').select('id').eq('phone', phone).maybeSingle();
+        if (existing) return err('An account with this mobile number already exists. Please log in.', 409);
+
+        const code = String(Math.floor(100000 + Math.random() * 900000));
+        const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        await admin.from('otp_codes').update({ consumed: true }).eq('email', phone).eq('consumed', false);
+        const { error: insErr } = await admin.from('otp_codes').insert({
+          email: phone,
+          code,
+          expires_at,
+          payload: { type: 'phone_signup', role, full_name, password, phone },
+        });
+        if (insErr) return err(insErr.message, 400);
+        await sendSmsOtp(phone, code);
+        return json({ ok: true, expires_at, dev_otp: canUseDevOtpFallback() ? code : undefined });
+      }
+
+      if (!email || !password || !role) return err('email, password, role required', 400);
 
       // Reject if email already has an auth user
       const { data: existing } = await admin.from('user_profiles').select('id').eq('email', email).maybeSingle();
@@ -613,15 +643,21 @@ async function route(request, { params }) {
 
     // STEP 2: verify OTP -> create user, return session.
     if (path === 'auth/verify-otp' && method === 'POST') {
-      const { email, otp } = await request.json();
-      if (!email || !otp) return err('email and otp required', 400);
+      const body = await request.json();
+      const { email, otp } = body;
+      const isPhoneSignup = body.auth_method === 'phone';
+      const phone = isPhoneSignup ? normalizePhone(String(body.phone || '').trim()) : null;
+      const otpKey = isPhoneSignup ? phone : email;
+      if (!otpKey || !otp) return err(`${isPhoneSignup ? 'phone' : 'email'} and otp required`, 400);
 
       const { data: row } = await admin.from('otp_codes').select('*')
-        .eq('email', email).eq('consumed', false)
+        .eq('email', otpKey).eq('consumed', false)
         .order('created_at', { ascending: false }).limit(1).maybeSingle();
 
       if (!row) return err('No pending verification. Please request a new code.', 400);
       if (row.payload?.type === 'reset') return err('This code is for password reset, not signup.', 400);
+      if (isPhoneSignup && row.payload?.type !== 'phone_signup') return err('This code is not for mobile signup.', 400);
+      if (!isPhoneSignup && row.payload?.type === 'phone_signup') return err('This code is for mobile signup.', 400);
       if (new Date(row.expires_at) < new Date()) return err('Code expired. Request a new one.', 400);
       if (row.attempts >= 5) return err('Too many attempts. Request a new code.', 400);
 
@@ -630,30 +666,43 @@ async function route(request, { params }) {
         return err('Invalid code', 400);
       }
 
-      // Mark consumed
-      await admin.from('otp_codes').update({ consumed: true }).eq('id', row.id);
-
       const { role, full_name, password } = row.payload || {};
+      const verifiedPhone = isPhoneSignup ? normalizePhone(row.payload?.phone || phone) : null;
+      const internalMobileEmail = isPhoneSignup ? mobileAuthEmail(verifiedPhone) : null;
       // Create user
-      const { data: created, error: cErr } = await admin.auth.admin.createUser({
-        email, password, email_confirm: true,
-        user_metadata: { role, full_name },
-      });
+      const authUser = isPhoneSignup
+        ? { email: internalMobileEmail, password, email_confirm: true, user_metadata: { role, full_name, phone: verifiedPhone, auth_method: 'phone' } }
+        : { email, password, email_confirm: true, user_metadata: { role, full_name } };
+      const { data: created, error: cErr } = await admin.auth.admin.createUser(authUser);
       if (cErr) return err(cErr.message, 400);
       const user = created.user;
       const login_id = await generateLoginId(admin);
 
-      await admin.from('user_profiles').insert({
+      const profilePayload = {
         id: user.id,
-        email,
+        ...(isPhoneSignup ? { phone: verifiedPhone } : { email }),
         role,
         full_name: full_name || null,
         login_id,
-      });
+      };
+      let { error: profileErr } = await admin.from('user_profiles').insert(profilePayload);
+      if (profileErr && isPhoneSignup && /email|null/i.test(String(profileErr.message || ''))) {
+        ({ error: profileErr } = await admin.from('user_profiles').insert({ ...profilePayload, email: internalMobileEmail }));
+      }
+      if (profileErr) {
+        await admin.auth.admin.deleteUser(user.id).catch(() => {});
+        return err(profileErr.message, 400);
+      }
+      let roleInsert;
       if (role === 'worker') {
-        await admin.from('workers').insert({ user_id: user.id });
+        roleInsert = await admin.from('workers').insert({ user_id: user.id, ...(isPhoneSignup ? { mobile_verified: true } : {}) });
       } else {
-        await admin.from('employers').insert({ user_id: user.id });
+        roleInsert = await admin.from('employers').insert({ user_id: user.id, ...(isPhoneSignup ? { mobile_verified: true } : {}) });
+      }
+      if (isPhoneSignup && roleInsert?.error) {
+        await admin.from('user_profiles').delete().eq('id', user.id);
+        await admin.auth.admin.deleteUser(user.id).catch(() => {});
+        return err(roleInsert.error.message, 400);
       }
 
       // Sign in
@@ -661,51 +710,79 @@ async function route(request, { params }) {
         process.env.NEXT_PUBLIC_SUPABASE_URL,
         process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
       );
-      const { data: signed, error: sErr } = await supaAnon.auth.signInWithPassword({ email, password });
-      if (sErr) return err(sErr.message, 400);
+      const signInCredentials = isPhoneSignup ? { email: internalMobileEmail, password } : { email, password };
+      const { data: signed, error: sErr } = await supaAnon.auth.signInWithPassword(signInCredentials);
+      if (sErr) {
+        if (isPhoneSignup) {
+          await admin.from(role === 'worker' ? 'workers' : 'employers').delete().eq('user_id', user.id);
+          await admin.from('user_profiles').delete().eq('id', user.id);
+          await admin.auth.admin.deleteUser(user.id).catch(() => {});
+        }
+        return err(sErr.message, 400);
+      }
 
-      await sendEmail({
-        to: email,
-        subject: 'Welcome to Work2Wish',
-        html: `
-          <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;background:#f8fafc">
-            <div style="background:#4f46e5;color:#ffffff;padding:24px;border-radius:16px;text-align:center">
-              <h1 style="margin:0;font-size:24px;">Welcome to Work2Wish</h1>
+      // Consume the OTP only after account creation and automatic sign-in both succeed.
+      await admin.from('otp_codes').update({ consumed: true }).eq('id', row.id);
+
+      if (!isPhoneSignup) {
+        await sendEmail({
+          to: email,
+          subject: 'Welcome to Work2Wish',
+          html: `
+            <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;background:#f8fafc">
+              <div style="background:#4f46e5;color:#ffffff;padding:24px;border-radius:16px;text-align:center">
+                <h1 style="margin:0;font-size:24px;">Welcome to Work2Wish</h1>
+              </div>
+              <div style="background:#ffffff;padding:24px;border-radius:16px;box-shadow:0 8px 24px rgba(15,23,42,0.08);margin-top:-16px">
+                <p style="font-size:16px;color:#0f172a;margin:0 0 16px;">Hi ${full_name || 'there'},</p>
+                <p style="font-size:15px;color:#334155;line-height:1.7;margin:0 0 16px;">Your ${role} account has been created successfully. You can now sign in using your email address or your unique Work2Wish login ID.</p>
+                <p style="font-size:15px;color:#334155;line-height:1.7;margin:0 0 12px;">Login ID:</p>
+                <div style="font-size:22px;font-weight:700;color:#4f46e5;padding:16px 18px;background:#eef2ff;border-radius:12px;text-align:center;letter-spacing:2px;">${login_id}</div>
+                <p style="font-size:14px;color:#64748b;line-height:1.7;margin:18px 0 0;">If you ever need help, reply to this email or visit Work2Wish support.</p>
+              </div>
             </div>
-            <div style="background:#ffffff;padding:24px;border-radius:16px;box-shadow:0 8px 24px rgba(15,23,42,0.08);margin-top:-16px">
-              <p style="font-size:16px;color:#0f172a;margin:0 0 16px;">Hi ${full_name || 'there'},</p>
-              <p style="font-size:15px;color:#334155;line-height:1.7;margin:0 0 16px;">Your ${role} account has been created successfully. You can now sign in using your email address or your unique Work2Wish login ID.</p>
-              <p style="font-size:15px;color:#334155;line-height:1.7;margin:0 0 12px;">Login ID:</p>
-              <div style="font-size:22px;font-weight:700;color:#4f46e5;padding:16px 18px;background:#eef2ff;border-radius:12px;text-align:center;letter-spacing:2px;">${login_id}</div>
-              <p style="font-size:14px;color:#64748b;line-height:1.7;margin:18px 0 0;">If you ever need help, reply to this email or visit Work2Wish support.</p>
-            </div>
-          </div>
-        `,
+          `,
+        });
+      }
+
+      return json({
+        user: signed.user,
+        session: signed.session,
+        role,
+        login_id,
+        profile: { id: user.id, email: isPhoneSignup ? null : email, phone: verifiedPhone, role, full_name, login_id },
       });
-
-      return json({ user: signed.user, session: signed.session, role, login_id });
     }
 
     // Resend OTP (signup flow)
     if (path === 'auth/resend-otp' && method === 'POST') {
-      const { email } = await request.json();
-      if (!email) return err('email required', 400);
+      const body = await request.json();
+      const { email } = body;
+      const isPhoneSignup = body.auth_method === 'phone';
+      const phone = isPhoneSignup ? normalizePhone(String(body.phone || '').trim()) : null;
+      const otpKey = isPhoneSignup ? phone : email;
+      if (!otpKey) return err(`${isPhoneSignup ? 'phone' : 'email'} required`, 400);
       const { data: prev } = await admin.from('otp_codes').select('payload')
-        .eq('email', email).eq('consumed', false)
+        .eq('email', otpKey).eq('consumed', false)
         .order('created_at', { ascending: false }).limit(1).maybeSingle();
       if (!prev) return err('No pending signup. Start signup again.', 400);
 
       const code = String(Math.floor(100000 + Math.random() * 900000));
       const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-      await admin.from('otp_codes').update({ consumed: true }).eq('email', email).eq('consumed', false);
-      await admin.from('otp_codes').insert({ email, code, expires_at, payload: prev.payload });
-      await sendEmail({
-        to: email,
-        subject: `Your Work2Wish code: ${code}`,
-        html: otpEmailHtml(code, prev.payload?.full_name),
-        required: true,
-      });
-      return json({ ok: true, expires_at });
+      await admin.from('otp_codes').update({ consumed: true }).eq('email', otpKey).eq('consumed', false);
+      await admin.from('otp_codes').insert({ email: otpKey, code, expires_at, payload: prev.payload });
+      if (isPhoneSignup) {
+        if (prev.payload?.type !== 'phone_signup') return err('No pending mobile signup. Start signup again.', 400);
+        await sendSmsOtp(phone, code);
+      } else {
+        await sendEmail({
+          to: email,
+          subject: `Your Work2Wish code: ${code}`,
+          html: otpEmailHtml(code, prev.payload?.full_name),
+          required: true,
+        });
+      }
+      return json({ ok: true, expires_at, dev_otp: isPhoneSignup && canUseDevOtpFallback() ? code : undefined });
     }
 
     // ===== FORGOT PASSWORD (OTP-based reset) =====
@@ -953,29 +1030,53 @@ async function route(request, { params }) {
       });
     }
 
-    // LOGIN — accepts email OR 6-digit login_id
+    // LOGIN — accepts email, 6-digit login_id, or verified mobile number
     if (path === 'auth/login' && method === 'POST') {
-      const { identifier, email, password } = await request.json();
+      const { identifier, email, password, login_method } = await request.json();
       const idf = (identifier || email || '').trim();
       if (!idf || !password) return err('identifier and password required', 400);
-
-      let resolvedEmail = idf;
-      // If looks like a login_id (6 digits) or no '@', try lookup
-      if (!idf.includes('@')) {
-        const { data: row } = await admin.from('user_profiles').select('email').eq('login_id', idf).maybeSingle();
-        if (!row) return err('No account with that login ID', 401);
-        resolvedEmail = row.email;
-      }
 
       const supaAnon = (await import('@supabase/supabase-js')).createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL,
         process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
       );
-      const { data: signed, error: sErr } = await supaAnon.auth.signInWithPassword({ email: resolvedEmail, password });
+
+      let resolvedEmail = null;
+      let resolvedPhone = null;
+      let credentials;
+      if (login_method === 'phone') {
+        resolvedPhone = normalizePhone(idf);
+        if (!resolvedPhone) return err('Enter a valid mobile number', 400);
+        const { data: mobileProfile } = await admin.from('user_profiles')
+          .select('id,email')
+          .eq('phone', resolvedPhone)
+          .maybeSingle();
+        if (!mobileProfile) return err('No account with that mobile number', 401);
+        resolvedEmail = mobileProfile.email || mobileAuthEmail(resolvedPhone);
+        credentials = { email: resolvedEmail, password };
+      } else {
+        resolvedEmail = idf;
+        // If looks like a login_id (6 digits) or no '@', try lookup
+        if (!idf.includes('@')) {
+          const { data: row } = await admin.from('user_profiles').select('email').eq('login_id', idf).maybeSingle();
+          if (!row?.email) return err('No account with that login ID', 401);
+          resolvedEmail = row.email;
+        }
+        credentials = { email: resolvedEmail, password };
+      }
+
+      let { data: signed, error: sErr } = await supaAnon.auth.signInWithPassword(credentials);
+      if (sErr && login_method === 'phone') {
+        ({ data: signed, error: sErr } = await supaAnon.auth.signInWithPassword({ phone: resolvedPhone, password }));
+      }
       if (sErr) return err(sErr.message, 401);
       const { data: profile } = await admin.from('user_profiles').select('*').eq('id', signed.user.id).maybeSingle();
       if (profile?.blocked) return err('Your account has been blocked by admin.', 403);
-      await logActivity(admin, signed.user.id, 'login', { role: profile?.role || 'worker', email: profile?.email || resolvedEmail }, signed.user.id);
+      await logActivity(admin, signed.user.id, 'login', {
+        role: profile?.role || 'worker',
+        email: profile?.email || resolvedEmail,
+        phone: profile?.phone || resolvedPhone,
+      }, signed.user.id);
       return json({ user: signed.user, session: signed.session, role: profile?.role || 'worker', login_id: profile?.login_id, profile });
     }
 
