@@ -2023,14 +2023,13 @@ function AdminApp({ auth, onLogout }) {
                       onVerify={() => verifySection('verification')}
                       disabled={busy || selected.role === 'admin'}
                     >
-                      <InfoTile label={selected.role === 'worker' ? 'Aadhaar' : 'Company PAN'} value={selected.role === 'worker' ? selected.aadhaar_number : selected.pan_number} />
-                      {selected.role === 'worker' && <InfoTile label="PAN" value={selected.pan_number} />}
+                      {selected.role === 'worker' && <InfoTile label="Aadhaar" value={selected.aadhaar_number} />}
                       {selected.role === 'employer' && <InfoTile label="GST" value={selected.gst_number} />}
                       <div className="grid sm:grid-cols-2 gap-3">
                         {selected.role === 'worker' && <AdminDocPreview title="Aadhaar front" url={selected.aadhaar_front_url} />}
                         {selected.role === 'worker' && <AdminDocPreview title="Aadhaar back" url={selected.aadhaar_back_url} />}
                         <AdminDocPreview title={selected.role === 'employer' ? 'Company PAN front' : 'PAN front'} url={selected.pan_image_url} />
-                        <AdminDocPreview title={selected.role === 'employer' ? 'Company PAN back' : 'PAN back'} url={selected.pan_back_url} />
+                        {selected.role === 'worker' && <AdminDocPreview title="PAN back" url={selected.pan_back_url} />}
                         {selected.role === 'employer' && <AdminDocPreview title="GST certificate" url={selected.gst_certificate_url} />}
                         <AdminDocPreview title={selected.role === 'employer' ? 'Employer selfie' : 'Selfie'} url={selected.selfie_url || selected.selfie_front_url} />
                         {selected.role === 'worker' && <AdminDocPreview title="Skill certificate" url={selected.certificate_url} />}
@@ -2775,13 +2774,20 @@ function SignupOTP({ data, onAuthed, onBack }) {
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [resending, setResending] = useState(false);
-  const [secondsLeft, setSecondsLeft] = useState(60);
+  const [resendAvailableAt, setResendAvailableAt] = useState(() => Date.now() + 30_000);
+  const [secondsLeft, setSecondsLeft] = useState(30);
 
   useEffect(() => {
-    if (secondsLeft <= 0) return;
-    const t = setTimeout(() => setSecondsLeft(s => s - 1), 1000);
-    return () => clearTimeout(t);
-  }, [secondsLeft]);
+    const syncCountdown = () => setSecondsLeft(Math.max(0, Math.ceil((resendAvailableAt - Date.now()) / 1000)));
+    syncCountdown();
+    const timer = setInterval(syncCountdown, 500);
+    const onVisibility = () => { if (!document.hidden) syncCountdown(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [resendAvailableAt]);
 
   const verify = async () => {
     if (code.length !== 6) return toast.error('Enter the 6-digit code');
@@ -2804,7 +2810,8 @@ function SignupOTP({ data, onAuthed, onBack }) {
     try {
       await api('auth/resend-otp', { method: 'POST', body: { email: data.email } });
       toast.success('Sent a new code');
-      setSecondsLeft(60); setCode('');
+      setResendAvailableAt(Date.now() + 30_000);
+      setCode('');
     } catch (e) { toast.error(e.message); } finally { setResending(false); }
   };
 
@@ -5211,9 +5218,10 @@ function ProfileDetailsDialog({ data, onClose, onChat }) {
   const profileRole = String(p.role || p.user_role || p.account_type || '').toLowerCase();
   const hasCompanyIdentity = profileRole.includes('employer') || profileRole.includes('company') || profileRole.includes('business') || !!p.company_name || !!p.company_address || !!p.hr_contact || !!p.official_email || !!p.company_logo || !!p.company_logo_url || !!p.logo_url || !!p.logo;
   const hasWorkerIdentity = profileRole.includes('worker') || profileRole.includes('employee');
-  const isWorker = hasCompanyIdentity ? false : (hasWorkerIdentity || !!p.skills || !!p.resume_url || !!p.selfie_url || !!p.selfie_front_url);
+  const isWorker = hasCompanyIdentity ? false : (hasWorkerIdentity || !!p.skills || !!p.resume_url);
   const title = isWorker ? (p.full_name || p.name || 'Worker profile') : (p.company_name || p.full_name || 'Company profile');
-  const photo = isWorker ? (p.selfie_front_url || p.selfie_url || p.photo_url || p.profile_photo_url || p.profile_image_url || p.image_url) : (p.company_logo || p.company_logo_url || p.logo_url || p.logo || p.photo_url || p.profile_photo_url || p.profile_image_url || p.image_url);
+  // Selfie-verification images are private admin-only evidence. Public profiles use only the explicitly uploaded profile photo/company logo.
+  const photo = isWorker ? (p.photo_url || p.profile_photo_url || p.profile_image_url || p.image_url) : (p.company_logo || p.company_logo_url || p.logo_url || p.logo);
   const profileExtra = p.extra || p.details || {};
   const resumeUrl = p.resume_url || profileExtra.resume_url || p.resume || profileExtra.resume || p.resume_file_url || profileExtra.resume_file_url || p.cv_url || profileExtra.cv_url;
   const feedbacks = data?.feedbacks || [];
@@ -5801,8 +5809,8 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
     const pan = cleanPan(form.pan_number);
 
     if (isEmployer) {
-      if (!form.pan_image_url || !form.pan_back_url || !form.gst_certificate_url) {
-        return toast.error('Upload PAN front, PAN back and GST certificate');
+      if (!form.pan_image_url || !form.gst_certificate_url) {
+        return toast.error('Upload PAN front and GST certificate');
       }
     } else {
       const aadhaar = cleanAadhaar(form.aadhaar_number);
@@ -5817,7 +5825,6 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
     const body = isEmployer
       ? {
           pan_image_url: form.pan_image_url,
-          pan_back_url: form.pan_back_url,
           gst_certificate_url: form.gst_certificate_url,
           verification_status: 'pending',
           verification_section: 'documents',
@@ -5913,9 +5920,8 @@ function VerificationDocumentsCard({ token, me, role, verified, form, setForm, o
       <CardContent className="p-4 sm:p-5 space-y-5 bg-slate-50/40" onKeyDown={(e) => { if (e.key === 'Enter' && e.target?.tagName !== 'TEXTAREA') { e.preventDefault(); if (!busy && !lockedVerified) submitVerification(); } }}>
         {isEmployer ? (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 items-stretch rounded-3xl border border-slate-200 bg-white p-3 shadow-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-stretch rounded-3xl border border-slate-200 bg-white p-3 shadow-sm">
               <DocumentUploadBox color="emerald" label="Company PAN front" url={form.pan_image_url} verified={lockedVerified} disabled={busy} onFile={(file) => uploadDoc(file, 'pan_image_url', 'company-pan-front')} />
-              <DocumentUploadBox color="emerald" label="Company PAN back" url={form.pan_back_url} verified={lockedVerified} disabled={busy} onFile={(file) => uploadDoc(file, 'pan_back_url', 'company-pan-back')} />
               <DocumentUploadBox color="emerald" label="GST certificate" url={form.gst_certificate_url} verified={lockedVerified} disabled={busy} onFile={(file) => uploadDoc(file, 'gst_certificate_url', 'gst-certificate')} />
             </div>
           </>
@@ -6285,7 +6291,7 @@ const EMPLOYER_PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'company_name', 'i
 // Selfie fields are verified by the separate Selfie card and must not keep
 // this document card red after the admin has approved its documents.
 const WORKER_DOCUMENT_VERIFY_FIELDS = ['address', 'aadhaar_number', 'pan_number', 'aadhaar_front_url', 'aadhaar_back_url', 'pan_image_url', 'pan_back_url', 'certificate_url'];
-const EMPLOYER_DOCUMENT_VERIFY_FIELDS = ['gst_number', 'pan_number', 'pan_image_url', 'pan_back_url', 'gst_certificate_url'];
+const EMPLOYER_DOCUMENT_VERIFY_FIELDS = ['gst_number', 'pan_number', 'pan_image_url', 'gst_certificate_url'];
 
 function normalizeVerifyValue(key, value) {
   if (Array.isArray(value)) return value.map(v => String(v || '').trim()).filter(Boolean).join(',');
@@ -7711,6 +7717,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
   const [busyAction, setBusyAction] = useState('');
   const [sent, setSent] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [resendAvailableAt, setResendAvailableAt] = useState(0);
   const timerRef = useRef(null);
   const [editing, setEditing] = useState(false);
   const [localVerified, setLocalVerified] = useState(!!verified);
@@ -7719,31 +7726,21 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
   useEffect(() => setLocalVerified(!!verified), [verified]);
 
   useEffect(() => {
-    if (countdown <= 0) {
+    if (!resendAvailableAt) {
       setCountdown(0);
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
       return;
     }
-    timerRef.current = timerRef.current || setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          clearInterval(timerRef.current);
-          timerRef.current = null;
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+    const syncCountdown = () => setCountdown(Math.max(0, Math.ceil((resendAvailableAt - Date.now()) / 1000)));
+    syncCountdown();
+    timerRef.current = setInterval(syncCountdown, 500);
+    const onVisibility = () => { if (!document.hidden) syncCountdown(); };
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
+      if (timerRef.current) clearInterval(timerRef.current);
+      timerRef.current = null;
+      document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [countdown]);
+  }, [resendAvailableAt]);
 
   const isVerified = !!(verified || localVerified);
   const canEdit = !isVerified || editing;
@@ -7758,7 +7755,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
       }
       await api('auth/mobile-send-otp', { method: 'POST', token, body: { phone: normalized } });
       setSent(true);
-      setCountdown(60);
+      setResendAvailableAt(Date.now() + 30_000);
       toast.success('OTP sent successfully');
     } catch (err) {
       toast.error(err.message || 'Failed to send OTP');
@@ -7780,6 +7777,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
       setSent(false);
       setOtp('');
       setCountdown(0);
+      setResendAvailableAt(0);
       setEditing(false);
       toast.success('Mobile number verified');
     } catch (err) {
@@ -7827,7 +7825,7 @@ function MobileOtpVerificationBox({ token, phone, verified, onVerified }) {
             {busy && busyAction === 'send' ? <><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Sending...</> : countdown > 0 ? `Resend in ${countdown}s` : (sent ? 'Resend OTP' : 'Send OTP')}
           </Button>
           {isVerified && editing ? (
-            <Button type="button" variant="ghost" onClick={() => { setEditing(false); setMobile(phone || ''); setOtp(''); setSent(false); setCountdown(0); }}>Cancel</Button>
+            <Button type="button" variant="ghost" onClick={() => { setEditing(false); setMobile(phone || ''); setOtp(''); setSent(false); setCountdown(0); setResendAvailableAt(0); }}>Cancel</Button>
           ) : null}
         </div>
       )}
@@ -7898,7 +7896,7 @@ function isValidBankAccount(value) {
   return digits.length >= 9 && digits.length <= 18;
 }
 
-function Field({ label, v, on, type = 'text', required = true, maxLength, inputMode, helper, prefix }) {
+function Field({ label, v, on, type = 'text', required = true, maxLength, inputMode, helper, prefix, placeholder }) {
   const value = v ?? '';
   const isEmail = type === 'email';
   return (
@@ -7913,6 +7911,7 @@ function Field({ label, v, on, type = 'text', required = true, maxLength, inputM
             required={required}
             maxLength={maxLength}
             inputMode={inputMode}
+            placeholder={placeholder}
             onChange={(e) => on(e.target.value)}
             className="h-full min-w-0 flex-1 border-0 bg-white px-3 text-sm focus-visible:ring-0 focus-visible:ring-offset-0"
           />
@@ -7924,6 +7923,7 @@ function Field({ label, v, on, type = 'text', required = true, maxLength, inputM
           required={required}
           maxLength={maxLength}
           inputMode={inputMode}
+          placeholder={placeholder}
           pattern={isEmail ? '[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$' : undefined}
           onChange={(e) => on(isEmail ? cleanEmailValue(e.target.value) : e.target.value)}
         />
@@ -9884,7 +9884,6 @@ useEffect(() => {
     pan_number: f.pan_number || '',
     gst_number: cleanGstNumber(f.gst_number) || '',
     pan_image_url: f.pan_image_url || '',
-    pan_back_url: f.pan_back_url || '',
     gst_certificate_url: f.gst_certificate_url || '',
   });
 
@@ -9909,7 +9908,7 @@ useEffect(() => {
   };
 
   const requireEmployerDocuments = () => {
-    if (!f.pan_image_url || !f.pan_back_url) return 'Upload company PAN front and back';
+    if (!f.pan_image_url) return 'Upload company PAN front';
     if (!f.gst_certificate_url) return 'Upload GST certificate';
     return '';
   };
@@ -9934,6 +9933,7 @@ useEffect(() => {
     }
 
     if (!isValidIndianPhone10(f.phone)) return 'Enter valid 10-digit Indian mobile number';
+    if (!/^.{2,}\s*\([6-9]\d{9}\)$/.test(String(f.hr_contact || '').trim())) return 'Enter HR contact as Name (10-digit mobile), e.g. Ravi (9876543210)';
     if (!isValidEmailValue(f.official_email)) return 'Enter valid official email address';
     if (!isValidGstNumber(f.gst_number)) return 'Enter valid 15-character GST number';
 
@@ -10154,7 +10154,7 @@ useEffect(() => {
           <Field label="Phone"       v={cleanIndianPhone10(f.phone)}        on={(v) => setF(s => ({ ...s, phone: cleanIndianPhone10(v) }))} inputMode="numeric" maxLength={10} prefix="+91" helper="Enter 10-digit Indian mobile number" required />
           <Field label="Company"     v={f.company_name} on={(v) => setF(s => ({ ...s, company_name: v }))} required />
           <Field label="Industry type"    v={f.industry}     on={(v) => setF(s => ({ ...s, industry: v }))} required />
-          <Field label="HR contact person" v={f.hr_contact} on={(v) => setF(s => ({ ...s, hr_contact: v }))} required />
+          <Field label="HR contact person" v={f.hr_contact} on={(v) => setF(s => ({ ...s, hr_contact: v }))} placeholder="Ravi (9876543210)" helper="Enter contact name with mobile number in brackets, e.g. Ravi (9876543210)" required />
           <Field label="Official email" v={f.official_email} on={(v) => setF(s => ({ ...s, official_email: cleanEmailValue(v) }))} type="email" required />
           <div>
             <Label>Company size<span className="text-red-500 ml-0.5">*</span></Label>

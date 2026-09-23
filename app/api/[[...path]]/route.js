@@ -1698,8 +1698,19 @@ async function route(request, { params }) {
           .limit(20);
         blackMarks = bmRows || [];
       } catch {}
+      const publicProfile = { ...user, ...extra, role: user.role, id: user.id, black_mark_count: blackMarkCount };
+      // Selfie verification is private identity evidence and is intentionally available only in authenticated admin review flows.
+      delete publicProfile.selfie_url;
+      delete publicProfile.selfie_front_url;
+      delete publicProfile.selfie_left_url;
+      delete publicProfile.selfie_right_url;
+      delete publicProfile.selfie_verified_at;
+      if (user.role === 'employer') {
+        // Public employer identity image is the uploaded company logo only.
+        delete publicProfile.photo_url;
+      }
       return json({
-        profile: { ...user, ...extra, role: user.role, id: user.id, black_mark_count: blackMarkCount },
+        profile: publicProfile,
         stats: {
           completedWorks,
           feedbackCount: ratingCount || feedbacks.length,
