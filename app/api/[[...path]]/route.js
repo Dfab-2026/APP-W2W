@@ -578,11 +578,14 @@ async function route(request, { params }) {
     // ---------- AUTH ----------
     // STEP 1: send OTP. We hold the pending signup data in otp_codes.payload.
     if (path === 'auth/send-otp' && method === 'POST') {
-      const { email, password, role, full_name } = await request.json();
+      const { email: rawEmail, password, role, full_name } = await request.json();
+      const email = String(rawEmail || '').trim().toLowerCase();
       if (!email || !password || !role) return err('email, password, role required', 400);
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err('Enter a valid email address', 400);
       if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
 
-      // Reject if email already has an auth user
+      // Any valid email provider is supported here (Zoho, Microsoft 365, Google Workspace, custom domains, etc.).
+      // Google OAuth remains separate and is only for accounts Google can authenticate.
       const { data: existing } = await admin.from('user_profiles').select('id').eq('email', email).maybeSingle();
       if (existing) return err('An account with this email already exists. Please log in.', 409);
 
@@ -959,7 +962,7 @@ async function route(request, { params }) {
       const idf = (identifier || email || '').trim();
       if (!idf || !password) return err('identifier and password required', 400);
 
-      let resolvedEmail = idf;
+      let resolvedEmail = idf.includes('@') ? idf.toLowerCase() : idf;
       // If looks like a login_id (6 digits) or no '@', try lookup
       if (!idf.includes('@')) {
         const { data: row } = await admin.from('user_profiles').select('email').eq('login_id', idf).maybeSingle();
@@ -2741,7 +2744,15 @@ async function route(request, { params }) {
     if (path === 'chat/threads' && method === 'GET') {
       const { data: profile } = await admin.from('user_profiles').select('role').eq('id', me.id).maybeSingle();
       let peerIds = new Set();
-      if (profile?.role === 'worker') {
+      if (profile?.role === 'admin') {
+        // Admin Messages is a support inbox: every non-admin account is available
+        // immediately, even before the first message is sent.
+        const { data: allUsers } = await admin.from('user_profiles')
+          .select('id')
+          .neq('id', me.id)
+          .neq('role', 'admin');
+        (allUsers || []).forEach(u => u.id && peerIds.add(u.id));
+      } else if (profile?.role === 'worker') {
         const { data } = await admin.from('applications')
           .select('jobs!inner(employer_id)').eq('worker_id', me.id);
         (data || []).forEach(a => a.jobs?.employer_id && peerIds.add(a.jobs.employer_id));
@@ -2860,8 +2871,29 @@ async function route(request, { params }) {
         sender_id: me.id, receiver_id: body.receiver_id,
         content: body.content, job_id: body.job_id || null, application_id: body.application_id || null,
       };
+      if (!payload.receiver_id || !String(payload.content || '').trim()) return err('receiver_id and content required', 400);
+      payload.content = String(payload.content).trim();
+      if (payload.receiver_id === me.id) return err('Cannot message yourself', 400);
+
+      const { data: receiver } = await admin.from('user_profiles')
+        .select('id, role')
+        .eq('id', payload.receiver_id)
+        .maybeSingle();
+      if (!receiver) return err('Recipient not found', 404);
+
       const { data, error } = await admin.from('messages').insert(payload).select().single();
       if (error) return err(error.message, 400);
+
+      // Admin chat is also a support channel. Notify the user when an admin
+      // sends a message so the conversation is visible even when Chats is closed.
+      const { data: senderProfile } = await admin.from('user_profiles')
+        .select('role')
+        .eq('id', me.id)
+        .maybeSingle();
+      if (senderProfile?.role === 'admin') {
+        await notify(admin, payload.receiver_id, 'Admin message', payload.content, 'admin_message', me.id).catch(() => null);
+        await logActivity(admin, payload.receiver_id, 'admin_sent_message', { message_id: data.id }, me.id).catch(() => null);
+      }
       return json({ message: data });
     }
 

@@ -1549,15 +1549,6 @@ function AdminApp({ auth, onLogout }) {
 
   useEffect(() => { loadUsers(); }, [token, roleFilter, statusFilter]);
 
-  // Keep admin panel fresh when users submit verification from another tab/device.
-  useEffect(() => {
-    if (!token) return;
-    const t = setInterval(() => {
-      loadUsers();
-    }, 8000);
-    return () => clearInterval(t);
-  }, [token, roleFilter, statusFilter]);
-
   const openDetails = async (user) => {
     setSelected(user);
     setMessages([]);
@@ -1859,7 +1850,13 @@ function AdminApp({ auth, onLogout }) {
         )}
 
         {adminTab === 'messages' && (
-          <Card className="border-sky-200 bg-sky-50/70"><CardContent className="p-4 text-sm text-sky-800">Open a user from Users & Verification, then use the message box in the profile details popup to send correction requests or update notes.</CardContent></Card>
+          <div className="h-[calc(100dvh-220px)] min-h-[520px] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+            <ChatScreen
+              token={token}
+              me={{ id: auth?.profile?.id, profile: auth?.profile }}
+              color="emerald"
+            />
+          </div>
         )}
 
         {adminTab === 'safety' && (
@@ -2301,6 +2298,7 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [googleTermsAccepted, setGoogleTermsAccepted] = useState(false);
+  const identifierRef = useRef(null);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -2328,8 +2326,14 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
       if (error) throw error;
       if (data?.url && typeof window !== 'undefined') window.location.replace(data.url);
     } catch (e) {
-      toast.error(`Google sign-in failed: ${e.message}. Make sure Google is enabled in Supabase Auth → Providers.`);
+      toast.error(`Google sign-in failed: ${e.message}. If your company email is hosted on Zoho, Outlook, Microsoft 365, or another provider, use Company Email instead.`);
     }
+  };
+
+  const companyEmail = () => {
+    identifierRef.current?.focus();
+    identifierRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+    toast.info('Use your company email and password here. Zoho, Outlook, Microsoft 365, Google Workspace, and custom domains are supported.');
   };
 
   return (
@@ -2420,6 +2424,14 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
             </Button>
           </motion.div>
 
+          <motion.div whileHover={{ y: -2 }} whileTap={{ scale: 0.99 }}>
+            <Button type="button" variant="outline" className="w-full h-10 sm:h-12 mt-2 border-sky-200 hover:border-sky-400 hover:bg-sky-50 transition-shadow text-sm" onClick={companyEmail}>
+              <Building2 className="w-5 h-5 mr-2 text-sky-700" />
+              Continue with Company Email
+            </Button>
+          </motion.div>
+          <p className="text-[11px] text-center text-muted-foreground mt-1.5">Works with Zoho Mail, Outlook / Microsoft 365, Google Workspace and custom company domains.</p>
+
           <div className="flex items-center gap-3 my-3 sm:my-6">
             <Separator className="flex-1" />
             <span className="text-xs text-muted-foreground">OR</span>
@@ -2431,7 +2443,7 @@ function LoginPage({ onAuthed, onGotoSignup, onGotoForgot }) {
               <Label>Email or Login ID</Label>
               <div className="relative">
                 <Mail className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                <Input className="pl-9" value={identifier} onChange={e => setIdentifier(e.target.value)} placeholder="you@example.com or 234812" autoComplete="username" />
+                <Input ref={identifierRef} className="pl-9" value={identifier} onChange={e => setIdentifier(e.target.value)} placeholder="you@company.com or 234812" autoComplete="username" />
               </div>
             </div>
             <div>
@@ -2747,7 +2759,7 @@ function SignupForm({ data, onChange, onSent, onBack }) {
                       className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <>Send OTP <Send className="w-4 h-4 ml-2" /></>}
               </Button>
-              <p className="text-xs text-muted-foreground text-center">A 6-digit code will be sent to your email.</p>
+              <p className="text-xs text-muted-foreground text-center">A 6-digit code will be sent to your email. Company addresses hosted on Zoho, Outlook / Microsoft 365, Google Workspace and custom domains are supported.</p>
             </form>
           </CardContent>
         </Card>
@@ -11080,7 +11092,7 @@ function ChatScreen({ token, me, peerHint, color = 'indigo' }) {
                     {searchResults.map(u => (
                       <button key={u.peer_id} type="button" onClick={() => { setActive(u); setQuery(''); setSearchResults([]); }} className="w-full rounded-2xl border bg-white p-3 text-left flex items-center gap-3 hover:shadow-md transition">
                         <Avatar className="w-10 h-10 cursor-pointer" onClick={(e) => { e.stopPropagation(); u.peer_photo ? setPhotoPreview({ photo: u.peer_photo, title: u.peer_name }) : openProfileDetails(u.peer_id); }}><AvatarImage src={u.peer_photo} /><AvatarFallback>{initials(u.peer_name)}</AvatarFallback></Avatar>
-                        <div className="min-w-0"><p onClick={(e) => { e.stopPropagation(); openProfileDetails(u.peer_id); }} className="font-semibold truncate hover:underline">{u.peer_name}</p><p className="text-xs text-slate-500 truncate">{u.peer_role === 'employer' ? 'Company' : 'Worker'} · {u.location_text || u.email || ''}</p></div>
+                        <div className="min-w-0"><p onClick={(e) => { e.stopPropagation(); openProfileDetails(u.peer_id); }} className="font-semibold truncate hover:underline">{u.peer_name}</p><p className="text-xs text-slate-500 truncate">{u.peer_role === 'employer' ? 'Company' : u.peer_role === 'admin' ? 'Admin' : 'Worker'} · {u.location_text || u.email || ''}</p></div>
                       </button>
                     ))}
                   </div>
