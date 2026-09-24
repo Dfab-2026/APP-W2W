@@ -552,28 +552,52 @@ function urlBase64ToUint8Array(base64String) {
   return outputArray;
 }
 
-async function enableDeviceNotifications(token) {
-  if (typeof window === 'undefined') return;
-  if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
+async function enableDeviceNotifications(token, { requestPermission = true, silent = false, test = false } = {}) {
+  if (typeof window === 'undefined') return { ok: false, reason: 'server' };
+  if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) {
+    if (!silent) try { toast.error('Chrome notifications are not supported on this browser.'); } catch {}
+    return { ok: false, reason: 'unsupported' };
+  }
+  if (!window.isSecureContext && window.location.hostname !== 'localhost') {
+    if (!silent) try { toast.error('Chrome notifications require HTTPS.'); } catch {}
+    return { ok: false, reason: 'insecure' };
+  }
 
-  const permission = await Notification.requestPermission();
+  let permission = Notification.permission;
+  if (permission === 'default' && requestPermission) permission = await Notification.requestPermission();
   if (permission !== 'granted') {
-    try { toast.info('Notifications are disabled. You can enable them from browser settings anytime.'); } catch {}
-    return;
+    if (!silent) {
+      try {
+        toast.info(permission === 'denied'
+          ? 'Chrome alerts are blocked. Allow notifications for this site in Chrome settings, then try again.'
+          : 'Click Enable Chrome Alerts when you are ready to allow notifications.');
+      } catch {}
+    }
+    return { ok: false, reason: permission || 'default' };
   }
 
   const publicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
   if (!publicKey) {
-    try { toast.info('Notification permission enabled. Add NEXT_PUBLIC_VAPID_PUBLIC_KEY to enable background push alerts.'); } catch {}
-    return;
+    if (!silent) try { toast.error('Push notification public key is not configured.'); } catch {}
+    return { ok: false, reason: 'missing_vapid_key' };
   }
 
-  const registration = await navigator.serviceWorker.register('/w2w-service-worker.js');
+  await navigator.serviceWorker.register('/w2w-service-worker.js', { scope: '/' });
+  const registration = await navigator.serviceWorker.ready;
   let subscription = await registration.pushManager.getSubscription();
+  const expectedKey = urlBase64ToUint8Array(publicKey);
+  if (subscription?.options?.applicationServerKey) {
+    const currentKey = new Uint8Array(subscription.options.applicationServerKey);
+    const keyMatches = currentKey.length === expectedKey.length && currentKey.every((value, index) => value === expectedKey[index]);
+    if (!keyMatches) {
+      await subscription.unsubscribe().catch(() => false);
+      subscription = null;
+    }
+  }
   if (!subscription) {
     subscription = await registration.pushManager.subscribe({
       userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(publicKey),
+      applicationServerKey: expectedKey,
     });
   }
 
@@ -587,7 +611,9 @@ async function enableDeviceNotifications(token) {
     },
   });
 
-  try { toast.success('Device notifications enabled'); } catch {}
+  if (test) await api('push/test', { method: 'POST', token });
+  if (!silent) try { toast.success('Chrome alerts enabled'); } catch {}
+  return { ok: true, permission };
 }
 
 async function uploadFile(file, kind, token) {
@@ -1262,7 +1288,7 @@ export default function App() {
           saveSession(payload.session, payload.role, payload.profile);
           setAuth(payload);
           setScreenState(dashboardScreenForRole(fin.role));
-          setTimeout(() => enableDeviceNotifications(payload.session?.access_token).catch(() => {}), 600);
+          setTimeout(() => enableDeviceNotifications(payload.session?.access_token, { requestPermission: false, silent: true }).catch(() => {}), 600);
           if (typeof window !== 'undefined' && window.location.hash) {
             window.history.replaceState({}, '', window.location.pathname);
           }
@@ -1343,7 +1369,7 @@ export default function App() {
     saveSession(payload.session, payload.role, payload.profile);
     setAuth(payload);
     setScreenState(dashboardScreenForRole(data.role));
-    setTimeout(() => enableDeviceNotifications(payload.session?.access_token).catch(() => {}), 600);
+    setTimeout(() => enableDeviceNotifications(payload.session?.access_token, { requestPermission: false, silent: true }).catch(() => {}), 600);
     toast.success('Welcome to Work2Wish!');
   };
 
@@ -1493,6 +1519,7 @@ function AdminApp({ auth, onLogout }) {
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [adminMessage, setAdminMessage] = useState('');
   const [adminTab, setAdminTab] = useState('users');
+  const [approvalConfirm, setApprovalConfirm] = useState(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settings, setSettings] = useState({
     maintenance_mode: false,
@@ -1557,19 +1584,25 @@ function AdminApp({ auth, onLogout }) {
   useEffect(() => { loadUsers(); }, [token]);
 
   const openDetails = async (user) => {
-    // Open immediately with the already-loaded list data, then refresh the
-    // richer details and messages in the background. This keeps the existing
-    // admin flow but removes the full-card loading delay.
+    // Every signed-in account remains visible in the Admin list, but profile,
+    // document and bank details stay private until Send for Verification.
     setSelected(user);
     setMessages([]);
     setAdminMessage('');
+    if (user?.role !== 'admin' && user?.submitted_for_review === false) {
+      setLoadingDetails(false);
+      return;
+    }
+
+    // Submitted users still open immediately from list data, then refresh the
+    // richer verification detail in the background.
     setLoadingDetails(true);
     try {
       const [detail, msg] = await Promise.all([
         api(`admin/users/${user.id}`, { token }),
         api(`admin/users/${user.id}/messages`, { token }),
       ]);
-      setSelected((current) => current?.id === user.id ? (detail.user || current) : current);
+      setSelected((current) => current?.id === user.id ? ({ ...(detail.user || current), submitted_for_review: true }) : current);
       setMessages(msg.messages || []);
     } catch (e) {
       toast.error(e.message || 'Unable to load details');
@@ -1641,6 +1674,31 @@ function AdminApp({ auth, onLogout }) {
     } finally { setBusy(false); }
   };
 
+  const requestSectionApproval = (section, label) => {
+    if (!selected?.id || busy) return;
+    setApprovalConfirm({ type: 'section', section, label, userId: selected.id });
+  };
+
+  const requestFinalApproval = () => {
+    if (!selected?.id || busy) return;
+    if (adminUserRole !== 'admin' && !adminRequiredSectionsDone) {
+      toast.error(adminUserRole === 'worker' ? 'Verify Profile, Bank Details and Verification section first' : 'Verify Profile and Employer Verification section first');
+      return;
+    }
+    setApprovalConfirm({ type: 'final', label: 'Final account verification', userId: selected.id });
+  };
+
+  const confirmAdminApproval = async () => {
+    const action = approvalConfirm;
+    if (!action || busy) return;
+    setApprovalConfirm(null);
+    if (action.type === 'section') {
+      await verifySection(action.section);
+      return;
+    }
+    if (action.type === 'final') await verifyUser(action.userId, true);
+  };
+
   const activityDetails = (row) => {
     if (!row?.details) return {};
     if (typeof row.details === 'string') {
@@ -1690,6 +1748,7 @@ function AdminApp({ auth, onLogout }) {
   };
   const isSectionVerified = (section) => getAdminSectionState(section) === 'verified';
   const adminUserRole = (selected?.role || '').toLowerCase();
+  const selectedDetailsLocked = !!selected && adminUserRole !== 'admin' && selected?.submitted_for_review === false;
   const adminRequiredSections = adminUserRole === 'worker' ? ['profile', 'bank', 'verification'] : ['profile', 'verification'];
   const adminRequiredSectionsDone = adminRequiredSections.every(isSectionVerified);
 
@@ -1991,6 +2050,20 @@ function AdminApp({ auth, onLogout }) {
             <DialogDescription>Review account information, documents, verification status and administrative actions.</DialogDescription>
           </DialogHeader>
           {selected && (
+            selectedDetailsLocked ? (
+              <div className="min-h-[360px] flex items-center justify-center p-6">
+                <div className="w-full max-w-lg rounded-3xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+                  <div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-3xl bg-slate-100 text-slate-500">
+                    <ShieldAlert className="h-8 w-8" />
+                  </div>
+                  <h3 className="text-xl font-extrabold text-slate-950">Verification details not submitted yet</h3>
+                  <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                    This account is visible in the Admin user list, but its profile, bank and document details will appear here only after the user clicks Send for Verification.
+                  </p>
+                  <Badge variant="outline" className="mt-4 border-slate-200 bg-slate-50 text-slate-600">Waiting for user submission</Badge>
+                </div>
+              </div>
+            ) : (
             <div className="space-y-5">
               {loadingDetails && (
                 <div className="flex items-center gap-2 rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700">
@@ -2019,7 +2092,7 @@ function AdminApp({ auth, onLogout }) {
                       icon={<UserCircle className="w-4 h-4" />}
                       status={getAdminSectionState('profile')}
                       verified={isSectionVerified('profile')}
-                      onVerify={() => verifySection('profile')}
+                      onVerify={() => requestSectionApproval('profile', 'Profile')}
                       disabled={busy || selected.role === 'admin'}
                     >
                       {selected.role === 'worker' ? (
@@ -2068,7 +2141,7 @@ function AdminApp({ auth, onLogout }) {
                         icon={<Banknote className="w-4 h-4" />}
                         status={getAdminSectionState('bank')}
                         verified={isSectionVerified('bank')}
-                        onVerify={() => verifySection('bank')}
+                        onVerify={() => requestSectionApproval('bank', 'Bank Details')}
                         disabled={busy || selected.role === 'admin'}
                       >
                         <InfoTile label="Account holder" value={selected.account_holder_name || selected.full_name || selected.company_name} />
@@ -2088,7 +2161,7 @@ function AdminApp({ auth, onLogout }) {
                       icon={<ShieldCheck className="w-4 h-4" />}
                       status={getAdminSectionState('verification')}
                       verified={isSectionVerified('verification')}
-                      onVerify={() => verifySection('verification')}
+                      onVerify={() => requestSectionApproval('verification', verificationTitle)}
                       disabled={busy || selected.role === 'admin'}
                     >
                       {selected.role === 'worker' && <InfoTile label="Aadhaar" value={selected.aadhaar_number} />}
@@ -2146,7 +2219,7 @@ function AdminApp({ auth, onLogout }) {
                 <Button
                   type="button"
                   disabled={busy || adminUserRole === 'admin' || !!selected.verified || !adminRequiredSectionsDone}
-                  onClick={() => verifyUser(selected.id, true)}
+                  onClick={requestFinalApproval}
                   className="whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 disabled:!bg-emerald-600 disabled:!text-white disabled:!opacity-100 disabled:cursor-default"
                   style={selected.verified ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
                 >
@@ -2210,7 +2283,30 @@ function AdminApp({ auth, onLogout }) {
                 </div>
               </div>
             </div>
+            )
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!approvalConfirm} onOpenChange={(open) => !open && !busy && setApprovalConfirm(null)}>
+        <DialogContent className="sm:max-w-md rounded-2xl">
+          <DialogHeader>
+            <DialogTitle>Confirm approval</DialogTitle>
+            <DialogDescription>
+              {approvalConfirm?.type === 'final'
+                ? `Approve the complete account for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`
+                : `Approve ${approvalConfirm?.label || 'this section'} for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+            Review the submitted details before approving. Choose Cancel to return without changing the verification status.
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button type="button" variant="outline" disabled={busy} onClick={() => setApprovalConfirm(null)}>Cancel</Button>
+            <Button type="button" disabled={busy} onClick={confirmAdminApproval} className="bg-emerald-600 text-white hover:bg-emerald-700">
+              {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <CheckCircle2 className="w-4 h-4 mr-2" />} Approve
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
@@ -2230,7 +2326,7 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
       ? { label: 'Awaiting review', badge: 'border-amber-200 bg-amber-50 text-amber-700', button: 'bg-amber-500 hover:bg-amber-600', buttonLabel: 'Mark as approved', ButtonIcon: Clock }
       : normalizedStatus === 'rejected'
         ? { label: 'Needs correction', badge: 'border-rose-200 bg-rose-50 text-rose-700', button: 'bg-rose-600 hover:bg-rose-700', buttonLabel: 'Mark as approved', ButtonIcon: XCircle }
-        : { label: 'Not submitted', badge: 'border-slate-200 bg-slate-50 text-slate-600', button: 'bg-slate-900 hover:bg-slate-800', buttonLabel: 'Mark as approved', ButtonIcon: ShieldCheck };
+        : { label: 'Not submitted', badge: 'border-slate-200 bg-slate-50 text-slate-600', button: 'bg-slate-500 hover:bg-slate-500', buttonLabel: 'Waiting for submission', ButtonIcon: ShieldCheck };
   const ActionIcon = meta.ButtonIcon;
   return (
     <motion.section whileHover={{ y: -4 }} transition={{ type: 'spring', stiffness: 260, damping: 24 }} className={`relative overflow-hidden rounded-[28px] border ${palette.shell} p-5 shadow-xl ${palette.ring}`}>
@@ -2246,7 +2342,7 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
         <Button
           type="button"
           size="sm"
-          disabled={disabled || normalizedStatus === 'verified'}
+          disabled={disabled || normalizedStatus === 'verified' || normalizedStatus === 'not_submitted'}
           onClick={(event) => { event.preventDefault(); event.stopPropagation(); onVerify?.(); }}
           className={`${meta.button} h-10 min-w-[168px] shrink-0 whitespace-nowrap rounded-xl px-4 text-white shadow-md disabled:!opacity-100 disabled:cursor-default`}
           style={normalizedStatus === 'verified' ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
@@ -2977,6 +3073,8 @@ function NotificationCenter({
   const [notifications, setNotifications] = useState([]);
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushPermission, setPushPermission] = useState(() => typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'unsupported');
 
   const accentClasses = accent === 'emerald'
     ? {
@@ -3021,7 +3119,7 @@ function NotificationCenter({
     try {
       setLoading(true);
       const data = await api(`notifications?user_id=${userId}`, { token });
-      setNotifications(data.notifications || []);
+      setNotifications((data.notifications || []).map((item) => ({ ...item, message: item.message || item.body || '' })));
     } catch (e) {
       toast.error('Unable to load notifications');
     } finally {
@@ -3032,6 +3130,27 @@ function NotificationCenter({
   useEffect(() => {
     loadNotifications();
   }, [token, userId]);
+
+  useEffect(() => {
+    if (!token || typeof window === 'undefined' || !('Notification' in window)) return undefined;
+    setPushPermission(Notification.permission);
+    if (Notification.permission === 'granted') {
+      enableDeviceNotifications(token, { requestPermission: false, silent: true }).catch(() => {});
+    }
+    return undefined;
+  }, [token]);
+
+  useEffect(() => {
+    if (!userId || typeof window === 'undefined') return undefined;
+    const supabase = getSupabase();
+    const channel = supabase
+      .channel(`w2w-notifications-${channelKey}-${userId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications', filter: `user_id=eq.${userId}` }, () => {
+        loadNotifications();
+      })
+      .subscribe();
+    return () => { try { supabase.removeChannel(channel); } catch {} };
+  }, [userId, token, channelKey]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -3103,6 +3222,43 @@ function NotificationCenter({
     setSelected(item);
   };
 
+  const deleteNotification = async (id) => {
+    if (!id || !token) return;
+    const previous = notifications;
+    setNotifications((current) => current.filter((item) => item.id !== id));
+    if (selected?.id === id) setSelected(null);
+    try {
+      await api(`notifications/${id}`, { method: 'DELETE', token });
+      toast.success('Notification deleted');
+    } catch (e) {
+      setNotifications(previous);
+      toast.error(e.message || 'Unable to delete notification');
+    }
+  };
+
+  const enableChromeAlerts = async () => {
+    if (!token || pushBusy) return;
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      toast.error('Chrome notifications are not supported on this browser.');
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      setPushPermission('denied');
+      toast.info('Chrome has blocked notifications for this site. Open Site settings → Notifications → Allow, then press Enable Chrome Alerts again.');
+      return;
+    }
+    setPushBusy(true);
+    try {
+      const result = await enableDeviceNotifications(token, { requestPermission: true, silent: false, test: true });
+      setPushPermission(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+      if (result?.ok) await loadNotifications();
+    } catch (e) {
+      toast.error(e.message || 'Unable to enable Chrome alerts');
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
   return (
     <>
       <Button
@@ -3165,13 +3321,27 @@ function NotificationCenter({
 
                   {!selected && (
                     <div className="flex items-center gap-2 shrink-0">
+                      {pushPermission !== 'granted' && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={pushBusy}
+                          onClick={enableChromeAlerts}
+                          className="h-9 rounded-xl text-xs bg-white border-sky-200 text-sky-700 hover:bg-sky-50"
+                        >
+                          {pushBusy ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : <Bell className="w-3.5 h-3.5 mr-1.5" />}
+                          {pushPermission === 'denied' ? 'Alerts blocked' : 'Enable Chrome Alerts'}
+                        </Button>
+                      )}
                       {unreadCount > 0 && (
                         <Button
                           type="button"
                           variant="ghost"
                           size="sm"
-                          onClick={() => {
+                          onClick={async () => {
                             setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+                            await api('notifications/read-all', { method: 'POST', token }).catch(() => null);
                             toast.success('All marked as read');
                           }}
                           className="h-9 rounded-xl text-xs text-slate-700 hover:bg-white"
@@ -3223,7 +3393,7 @@ function NotificationCenter({
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-3 gap-2">
                     <Button
                       type="button"
                       variant="outline"
@@ -3231,6 +3401,14 @@ function NotificationCenter({
                       onClick={() => setSelected(null)}
                     >
                       <ArrowLeft className="w-4 h-4 mr-2" /> Back
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="h-11 rounded-2xl bg-white border-rose-200 text-rose-700 hover:bg-rose-50"
+                      onClick={() => deleteNotification(selected?.id)}
+                    >
+                      <Trash2 className="w-4 h-4 mr-2" /> Delete
                     </Button>
                     <Button
                       type="button"
@@ -3290,7 +3468,19 @@ function NotificationCenter({
                                   )}
                                 </div>
                               </div>
-                              <ArrowRight className="w-4 h-4 text-slate-400 shrink-0 mt-1" />
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 rounded-xl text-slate-400 hover:bg-rose-50 hover:text-rose-600 shrink-0"
+                                title="Delete notification"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  deleteNotification(item.id);
+                                }}
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </Button>
                             </div>
 
                             <p className="text-xs text-slate-600 mt-2 line-clamp-2 leading-snug">
@@ -3643,7 +3833,7 @@ function ProfileCompletionReminder({ role, me, currentTab, onOpenProfile }) {
   );
 }
 
-function EngagementNudges({ role, userId, onNavigate }) {
+function EngagementNudges({ role, userId, token, onNavigate }) {
   const navigateRef = useRef(onNavigate);
   useEffect(() => { navigateRef.current = onNavigate; }, [onNavigate]);
   useEffect(() => {
@@ -3655,12 +3845,19 @@ function EngagementNudges({ role, userId, onNavigate }) {
     const schedule = (first = false) => {
       const delay = first ? 90000 : (12 + Math.floor(Math.random() * 9)) * 60 * 1000;
       timer = setTimeout(() => {
+        const lastIndex = Number(localStorage.getItem(storageKey) || -1);
+        let nextIndex = Math.floor(Math.random() * pool.length);
+        if (pool.length > 1 && nextIndex === lastIndex) nextIndex = (nextIndex + 1) % pool.length;
+        localStorage.setItem(storageKey, String(nextIndex));
+        const item = pool[nextIndex];
+        if (token) {
+          api('notifications/engagement', {
+            method: 'POST',
+            token,
+            body: { title: item.title, message: item.message, target: item.target },
+          }).catch(() => null);
+        }
         if (document.visibilityState === 'visible') {
-          const lastIndex = Number(localStorage.getItem(storageKey) || -1);
-          let nextIndex = Math.floor(Math.random() * pool.length);
-          if (pool.length > 1 && nextIndex === lastIndex) nextIndex = (nextIndex + 1) % pool.length;
-          localStorage.setItem(storageKey, String(nextIndex));
-          const item = pool[nextIndex];
           toast(item.title, {
             description: item.message,
             duration: 9000,
@@ -3672,7 +3869,7 @@ function EngagementNudges({ role, userId, onNavigate }) {
     };
     schedule(true);
     return () => clearTimeout(timer);
-  }, [role, userId]);
+  }, [role, userId, token]);
   return null;
 }
 
@@ -3796,7 +3993,7 @@ function WorkerApp({ auth, onLogout }) {
   return (
     <div className="w2w-dashboard-shell h-[100dvh] max-h-[100dvh] bg-slate-50 overflow-hidden flex flex-col">
       <ProfileCompletionReminder role="worker" me={me} currentTab={tab} onOpenProfile={() => setTab('profile')} />
-      <EngagementNudges role="worker" userId={me?.profile?.id} onNavigate={(target) => setTab(target || 'home')} />
+      <EngagementNudges role="worker" userId={me?.profile?.id} token={token} onNavigate={(target) => setTab(target || 'home')} />
       {/* top bar — premium */}
       <header className="bg-gradient-to-r from-[#04112f] via-[#071f55] to-[#0b3b91] backdrop-blur-xl border-b border-blue-400/20 shrink-0 z-10 shadow-[0_10px_34px_rgba(7,31,85,0.30)]">
         <div className="container py-2.5 flex items-center justify-between gap-3">
@@ -7372,7 +7569,7 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
           </div>
           <div className="sm:col-span-2">
             <Label>Previous employer reference<span className="text-red-500 ml-0.5">*</span></Label>
-            <Textarea required rows={2} value={form.previous_employer_reference || ''} onChange={(e) => setForm(f => ({ ...f, previous_employer_reference: e.target.value }))} placeholder="Company/person name and contact if available" />
+            <Textarea required rows={2} value={form.previous_employer_reference || ''} onChange={(e) => setForm(f => ({ ...f, previous_employer_reference: e.target.value }))} placeholder="Company name, HR name and contact number (e.g. ABC Industries - Ravi HR (9876543210))" />
           </div>
           <div className="sm:col-span-2">
             <Label>Bio<span className="text-red-500 ml-0.5">*</span></Label>
@@ -8372,7 +8569,7 @@ function EmployerApp({ auth, onLogout }) {
   return (
     <div className="w2w-dashboard-shell h-[100dvh] max-h-[100dvh] bg-slate-50 overflow-hidden flex flex-col">
       <ProfileCompletionReminder role="employer" me={me} currentTab={tab} onOpenProfile={() => setTab('profile')} />
-      <EngagementNudges role="employer" userId={me?.profile?.id} onNavigate={(target) => setTab(target || 'dashboard')} />
+      <EngagementNudges role="employer" userId={me?.profile?.id} token={token} onNavigate={(target) => setTab(target || 'dashboard')} />
       <header className="bg-gradient-to-r from-[#04112f] via-[#071f55] to-[#0b3b91] backdrop-blur-xl border-b border-blue-400/20 shrink-0 z-10 shadow-[0_10px_34px_rgba(7,31,85,0.30)]">
         <div className="container py-2.5 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">

@@ -58,6 +58,38 @@ function normalizeVerifySectionName(section) {
   return section === 'verification' ? 'documents' : section;
 }
 
+function isSubmittedForAdminReview(user) {
+  if (!user) return false;
+  const role = String(user.role || '').toLowerCase();
+  if (role === 'admin') return true;
+  if (user.verified === true) return true;
+
+  const statuses = user.section_statuses && typeof user.section_statuses === 'object'
+    ? user.section_statuses
+    : {};
+  const requiredSections = role === 'worker'
+    ? ['profile', 'bank', 'documents']
+    : role === 'employer'
+      ? ['profile', 'documents']
+      : [];
+  const submittedStates = new Set(['pending', 'submitted', 'verified', 'rejected']);
+  const sectionState = (section) => {
+    const raw = statuses[section] || (section === 'documents' ? statuses.verification : '');
+    return String(raw || '').toLowerCase();
+  };
+
+  // A profile joins the Admin verification queue only after every required
+  // profile card has actually been sent for review at least once.
+  if (requiredSections.length && Object.keys(statuses).length) {
+    return requiredSections.every((section) => submittedStates.has(sectionState(section)));
+  }
+
+  // Compatibility fallback for older already-reviewed rows that pre-date the
+  // per-section status map. New submissions always populate section_statuses.
+  const status = String(user.verification_status || '').toLowerCase();
+  return ['verified', 'rejected'].includes(status);
+}
+
 function buildSectionStatusPatch(existing, sections, state = 'verified') {
   const base = existing && typeof existing === 'object' && !Array.isArray(existing) ? { ...existing } : {};
   for (const raw of sections) {
@@ -982,6 +1014,55 @@ async function route(request, { params }) {
       return json({ user: signed.user, session: signed.session, role: profile?.role || 'worker', login_id: profile?.login_id, profile });
     }
 
+    // ---------- Scheduled engagement push (uses the existing Web Push pipeline) ----------
+    if (path === 'cron/engagement' && method === 'GET') {
+      const cronSecret = process.env.CRON_SECRET || '';
+      const authorization = request.headers.get('authorization') || '';
+      if (!cronSecret || authorization !== `Bearer ${cronSecret}`) return err('Unauthorized', 401);
+
+      const workerMessages = [
+        ['Fresh jobs are waiting', 'Open Work2Wish and check today’s opportunities near you.'],
+        ['Stay ready for replies', 'Check your chats for employer or Admin updates.'],
+        ['Keep your profile job-ready', 'Updated skills and experience help employers understand you faster.'],
+        ['Check your applications', 'See whether any employer has moved your application forward.'],
+        ['Your next opportunity may be waiting', 'Open Work2Wish and review suitable jobs when you have a moment.'],
+        ['Keep your documents ready', 'Review your verification status so nothing blocks your next step.'],
+      ];
+      const employerMessages = [
+        ['Your next candidate may be waiting', 'Open Work2Wish and review recent applicants.'],
+        ['Hiring follow-up time', 'Check Chats for candidate replies and questions.'],
+        ['Keep your company profile current', 'Accurate company and HR details help workers trust your openings.'],
+        ['Review your hiring pipeline', 'Check pending, selected and ongoing workers in Work2Wish.'],
+        ['Ready to hire?', 'Post a clear opening or review the candidates already waiting.'],
+        ['Stay on top of active work', 'Review hired workers and attendance from your Work2Wish dashboard.'],
+      ];
+
+      const { data: subscriptions, error: subError } = await admin
+        .from('user_push_subscriptions')
+        .select('user_id')
+        .eq('enabled', true)
+        .limit(1000);
+      if (subError) return err(subError.message, 400);
+      const userIds = [...new Set((subscriptions || []).map((row) => row.user_id).filter(Boolean))];
+      if (!userIds.length) return json({ ok: true, notified: 0 });
+
+      const { data: profiles, error: profileError } = await admin
+        .from('user_profiles')
+        .select('id,role,blocked')
+        .in('id', userIds);
+      if (profileError) return err(profileError.message, 400);
+
+      let notified = 0;
+      for (const profile of profiles || []) {
+        if (profile.blocked || !['worker', 'employer'].includes(profile.role)) continue;
+        const pool = profile.role === 'employer' ? employerMessages : workerMessages;
+        const [title, body] = pool[Math.floor(Math.random() * pool.length)];
+        await notify(admin, profile.id, title, body, 'engagement', null);
+        notified += 1;
+      }
+      return json({ ok: true, notified });
+    }
+
     // ---------- Auth required for everything below ----------
     const me = await getUserFromRequest(request);
     if (!me) return err('Unauthorized', 401);
@@ -1283,6 +1364,31 @@ async function route(request, { params }) {
         };
       });
 
+      // Keep every registered/signed-in account visible in the Admin list.
+      // Before Send for Verification, expose only account-level list fields and
+      // keep worker/employer profile, bank and document data private. Once the
+      // required verification sections are submitted, the normal full Admin
+      // review data becomes available.
+      users = users.map((user) => {
+        const submittedForReview = isSubmittedForAdminReview(user);
+        if (submittedForReview || user.role === 'admin') {
+          return { ...user, submitted_for_review: submittedForReview };
+        }
+        return {
+          id: user.id,
+          email: user.email,
+          role: user.role,
+          full_name: user.full_name,
+          login_id: user.login_id,
+          blocked: !!user.blocked,
+          verified: !!user.verified,
+          verification_status: 'not_submitted',
+          created_at: user.created_at,
+          updated_at: user.updated_at,
+          submitted_for_review: false,
+        };
+      });
+
       // Preserve the endpoint's existing query/filter contract for any caller
       // that still supplies filters, even though the admin UI filters locally.
       const url = new URL(request.url);
@@ -1318,6 +1424,7 @@ async function route(request, { params }) {
       const userId = path.split('/')[2];
       const user = await getUserAdminDetail(userId);
       if (!user) return err('User not found', 404);
+      if (!isSubmittedForAdminReview(user)) return err('Profile has not been submitted for verification', 404);
       let jobs = [], applications = [], activity = [];
       try {
         if (user.role === 'employer') {
@@ -1333,7 +1440,7 @@ async function route(request, { params }) {
         const { data } = await admin.from('activity_logs').select('*').or(`user_id.eq.${userId},actor_id.eq.${userId}`).order('created_at', { ascending: false }).limit(40);
         activity = data || [];
       } catch (e) { activity = []; }
-      return json({ user: { ...user, jobs, applications, activity } });
+      return json({ user: { ...user, jobs, applications, activity, submitted_for_review: true } });
     }
 
     if (path.match(/^admin\/users\/[^/]+\/verify$/) && method === 'PATCH') {
@@ -1669,18 +1776,28 @@ async function route(request, { params }) {
       }
 
       if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
-        const { data: admins } = await admin.from('user_profiles').select('id').eq('role', 'admin').eq('blocked', false);
-        const displayName = profile?.full_name || profile?.company_name || profile?.email || 'A user';
-        const verificationSection = body.verification_section || 'documents';
-        const sectionLabel = verificationSection === 'bank' ? 'Bank details' : verificationSection === 'profile' ? 'Profile details' : 'Documents';
-        const changedFields = Object.keys(body).filter(k => !['verification_status','verification_notes','verification_section'].includes(k));
-        const isSkillOnly = changedFields.length === 1 && changedFields[0] === 'certificate_url';
-        const title = isSkillOnly ? 'Skill certificate needs review' : `${sectionLabel} needs review`;
-        const bodyText = isSkillOnly
-          ? `${displayName} added a skill certificate. Review it and mark the account verified again.`
-          : `${displayName} (${profile?.role || 'user'}) submitted ${sectionLabel.toLowerCase()} for admin verification. Updated: ${changedFields.join(', ') || sectionLabel}.`;
-        for (const a of admins || []) {
-          await notify(admin, a.id, title, bodyText, 'verification', me.id);
+        // Notify Admin only when the complete role-specific verification set has
+        // been submitted. This keeps incomplete/draft profiles out of the Admin
+        // workflow and prevents partial-profile review notifications.
+        const durable = await readVerificationSectionStates(admin, me.id);
+        const requiredSections = role === 'worker' ? ['profile', 'bank', 'documents'] : ['profile', 'documents'];
+        const submittedStates = new Set(['pending', 'submitted', 'verified', 'rejected']);
+        const readyForAdmin = requiredSections.every((section) => submittedStates.has(String(durable.statuses?.[section] || '').toLowerCase()));
+
+        if (readyForAdmin) {
+          const { data: admins } = await admin.from('user_profiles').select('id').eq('role', 'admin').eq('blocked', false);
+          const displayName = profile?.full_name || profile?.company_name || profile?.email || 'A user';
+          const verificationSection = body.verification_section || 'documents';
+          const sectionLabel = verificationSection === 'bank' ? 'Bank details' : verificationSection === 'profile' ? 'Profile details' : 'Documents';
+          const changedFields = Object.keys(body).filter(k => !['verification_status','verification_notes','verification_section'].includes(k));
+          const isSkillOnly = changedFields.length === 1 && changedFields[0] === 'certificate_url';
+          const title = isSkillOnly ? 'Skill certificate needs review' : `${sectionLabel} needs review`;
+          const bodyText = isSkillOnly
+            ? `${displayName} added a skill certificate. Review it and mark the account verified again.`
+            : `${displayName} (${profile?.role || 'user'}) submitted ${sectionLabel.toLowerCase()} for admin verification. Updated: ${changedFields.join(', ') || sectionLabel}.`;
+          for (const a of admins || []) {
+            await notify(admin, a.id, title, bodyText, 'verification', me.id);
+          }
         }
       }
 
@@ -1859,7 +1976,17 @@ async function route(request, { params }) {
     }
 
     if (path === 'push/test' && method === 'POST') {
-      await notify(admin, me.id, 'Work2Wish notifications enabled', 'You will receive important job, application, attendance and verification updates on this device.', 'device_push_test', me.id);
+      if (!process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+        return err('VAPID push keys are not configured on the server', 503);
+      }
+      const { count, error: countError } = await admin
+        .from('user_push_subscriptions')
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', me.id)
+        .eq('enabled', true);
+      if (countError) return err(countError.message, 400);
+      if (!count) return err('No active Chrome push subscription found for this account', 400);
+      await notify(admin, me.id, 'Work2Wish notifications enabled', 'Chrome alerts are active. You can receive Work2Wish updates even when the site is not open.', 'device_push_test', me.id);
       return json({ ok: true });
     }
 
@@ -2740,10 +2867,18 @@ async function route(request, { params }) {
     }
 
     // ---------- Notifications ----------
+    if (path === 'notifications/engagement' && method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const title = String(body.title || '').trim().slice(0, 120);
+      const message = String(body.message || '').trim().slice(0, 500);
+      if (!title || !message) return err('title and message required', 400);
+      await notify(admin, me.id, title, message, 'engagement', null);
+      return json({ ok: true });
+    }
     if (path === 'notifications' && method === 'GET') {
       const { data } = await admin.from('notifications')
         .select('*').eq('user_id', me.id).order('created_at', { ascending: false }).limit(75);
-      return json({ notifications: data || [] });
+      return json({ notifications: (data || []).map((item) => ({ ...item, message: item.body || '' })) });
     }
     if (path === 'notifications/read-all' && method === 'POST') {
       await admin.from('notifications').update({ read: true }).eq('user_id', me.id).eq('read', false);
@@ -2756,6 +2891,12 @@ async function route(request, { params }) {
     if (path.match(/^notifications\/[^/]+\/read$/) && method === 'POST') {
       const id = path.split('/')[1];
       await admin.from('notifications').update({ read: true }).eq('id', id).eq('user_id', me.id);
+      return json({ ok: true });
+    }
+    if (path.match(/^notifications\/[^/]+$/) && method === 'DELETE') {
+      const id = path.split('/')[1];
+      const { error } = await admin.from('notifications').delete().eq('id', id).eq('user_id', me.id);
+      if (error) return err(error.message, 400);
       return json({ ok: true });
     }
 
