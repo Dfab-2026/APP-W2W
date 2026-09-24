@@ -1223,32 +1223,81 @@ async function route(request, { params }) {
       const check = await requireAdmin();
       if (check.error) return err(check.error, check.status);
 
+      // Admin list performance: fetch each table once, in parallel, instead of
+      // running several database queries sequentially for every user.
+      const { data: profiles, error } = await admin.from('user_profiles')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (error) return err(error.message, 400);
+
+      const profileRows = profiles || [];
+      const workerIds = profileRows.filter((p) => p.role === 'worker').map((p) => p.id);
+      const employerIds = profileRows.filter((p) => p.role === 'employer').map((p) => p.id);
+      const allIds = profileRows.map((p) => p.id);
+
+      const workerPromise = workerIds.length
+        ? admin.from('workers').select('*').in('user_id', workerIds)
+        : Promise.resolve({ data: [], error: null });
+      const employerPromise = employerIds.length
+        ? admin.from('employers').select('*').in('user_id', employerIds)
+        : Promise.resolve({ data: [], error: null });
+      const sectionPromise = allIds.length
+        ? admin.from('user_verification_sections').select('user_id,section,status,submitted_at,verified_at,verified_by,updated_at').in('user_id', allIds)
+        : Promise.resolve({ data: [], error: null });
+
+      const [workerResult, employerResult, sectionResult] = await Promise.all([
+        workerPromise,
+        employerPromise,
+        sectionPromise,
+      ]);
+
+      // Keep the list usable even when the optional durable verification table
+      // has not been installed yet. Worker/employer table failures are surfaced
+      // only by missing role-specific fields, matching the old fallback behavior.
+      const workersByUser = new Map((workerResult?.data || []).map((row) => [row.user_id, row]));
+      const employersByUser = new Map((employerResult?.data || []).map((row) => [row.user_id, row]));
+      const sectionStatusesByUser = new Map();
+      const sectionRowsByUser = new Map();
+      if (!sectionResult?.error) {
+        for (const row of sectionResult?.data || []) {
+          const userId = row.user_id;
+          if (!sectionStatusesByUser.has(userId)) sectionStatusesByUser.set(userId, {});
+          if (!sectionRowsByUser.has(userId)) sectionRowsByUser.set(userId, []);
+          sectionStatusesByUser.get(userId)[normalizeVerifySectionName(row.section)] = row.status;
+          sectionRowsByUser.get(userId).push(row);
+        }
+      }
+
+      let users = profileRows.map((profile) => {
+        const extra = profile.role === 'worker'
+          ? workersByUser.get(profile.id)
+          : profile.role === 'employer'
+            ? employersByUser.get(profile.id)
+            : null;
+        const durableStatuses = sectionStatusesByUser.get(profile.id) || {};
+        return {
+          ...profile,
+          ...(extra || {}),
+          section_statuses: { ...((extra || {}).section_statuses || {}), ...durableStatuses },
+          verification_section_rows: sectionRowsByUser.get(profile.id) || [],
+        };
+      });
+
+      // Preserve the endpoint's existing query/filter contract for any caller
+      // that still supplies filters, even though the admin UI filters locally.
       const url = new URL(request.url);
       const roleFilter = url.searchParams.get('role') || '';
       const statusFilter = url.searchParams.get('status') || '';
       const search = (url.searchParams.get('q') || '').toLowerCase();
-
-      const { data: profiles, error } = await admin.from('user_profiles')
-        .select('id,email,full_name,phone,photo_url,role,login_id,blocked,created_at,updated_at')
-        .order('created_at', { ascending: false });
-      if (error) return err(error.message, 400);
-
-      let users = [];
-      for (const p of profiles || []) {
-        const detail = await getUserAdminDetail(p.id);
-        if (!detail) continue;
-        users.push(detail);
-      }
-
-      if (roleFilter && roleFilter !== 'all') users = users.filter(u => u.role === roleFilter);
+      if (roleFilter && roleFilter !== 'all') users = users.filter((u) => u.role === roleFilter);
       if (statusFilter && statusFilter !== 'all') {
-        if (statusFilter === 'blocked') users = users.filter(u => u.blocked);
-        else if (statusFilter === 'verified') users = users.filter(u => u.verified);
-        else if (statusFilter === 'pending') users = users.filter(u => u.verification_status === 'submitted' || u.verification_status === 'pending');
-        else if (statusFilter === 'unverified') users = users.filter(u => !u.verified);
+        if (statusFilter === 'blocked') users = users.filter((u) => u.blocked);
+        else if (statusFilter === 'verified') users = users.filter((u) => u.verified);
+        else if (statusFilter === 'pending') users = users.filter((u) => ['submitted', 'pending'].includes(u.verification_status || ''));
+        else if (statusFilter === 'unverified') users = users.filter((u) => !u.verified);
       }
       if (search) {
-        users = users.filter(u => `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
+        users = users.filter((u) => `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
       }
 
       // Show newly submitted verification requests at the top of the admin table.
@@ -2895,14 +2944,24 @@ async function route(request, { params }) {
       const { data, error } = await admin.from('messages').insert(payload).select().single();
       if (error) return err(error.message, 400);
 
-      // Admin chat is also a support channel. Notify the user when an admin
-      // sends a message so the conversation is visible even when Chats is closed.
+      // Use the existing Work2Wish notification + Web Push pipeline for every
+      // chat message so the recipient can be alerted even when the app is closed.
       const { data: senderProfile } = await admin.from('user_profiles')
-        .select('role')
+        .select('role,full_name,company_name')
         .eq('id', me.id)
         .maybeSingle();
+      const senderName = senderProfile?.role === 'admin'
+        ? 'Admin'
+        : (senderProfile?.company_name || senderProfile?.full_name || 'Work2Wish user');
+      await notify(
+        admin,
+        payload.receiver_id,
+        senderProfile?.role === 'admin' ? 'Admin message' : `New message from ${senderName}`,
+        payload.content,
+        senderProfile?.role === 'admin' ? 'admin_message' : 'chat_message',
+        me.id
+      ).catch(() => null);
       if (senderProfile?.role === 'admin') {
-        await notify(admin, payload.receiver_id, 'Admin message', payload.content, 'admin_message', me.id).catch(() => null);
         await logActivity(admin, payload.receiver_id, 'admin_sent_message', { message_id: data.id }, me.id).catch(() => null);
       }
       return json({ message: data });

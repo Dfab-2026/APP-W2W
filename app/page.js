@@ -1277,6 +1277,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!auth?.session?.access_token || !auth?.role) return;
+    const publicAuthScreens = new Set(['login', 'signup-role', 'signup-form', 'signup-otp', 'forgot-email', 'forgot-reset', 'oauth-role']);
+    if (publicAuthScreens.has(screen)) {
+      setNavigationHistory([]);
+      setScreenState(dashboardScreenForRole(auth.role));
+    }
+  }, [auth?.session?.access_token, auth?.role, screen]);
+
+  useEffect(() => {
     let expiryHandled = false;
     const onExpired = () => {
       if (expiryHandled) return;
@@ -1477,6 +1486,7 @@ function AdminApp({ auth, onLogout }) {
   const [roleFilter, setRoleFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
   const [busy, setBusy] = useState(false);
+  const [usersLoading, setUsersLoading] = useState(false);
   const [selected, setSelected] = useState(null);
   const [profileView, setProfileView] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -1521,43 +1531,45 @@ function AdminApp({ auth, onLogout }) {
 
   useEffect(() => { loadSettings(); }, []);
 
-  const adminStats = useMemo(() => ({
-    total: users.length,
-    workers: users.filter(u => u.role === 'worker').length,
-    employers: users.filter(u => u.role === 'employer').length,
-    pending: users.filter(u => u.verification_status === 'submitted' || u.verification_status === 'pending').length,
-    verified: users.filter(u => u.verified).length,
-    blocked: users.filter(u => u.blocked).length,
-  }), [users]);
+  const adminStats = useMemo(() => users.reduce((stats, user) => {
+    stats.total += 1;
+    if (user.role === 'worker') stats.workers += 1;
+    if (user.role === 'employer') stats.employers += 1;
+    if (user.verification_status === 'submitted' || user.verification_status === 'pending') stats.pending += 1;
+    if (user.verified) stats.verified += 1;
+    if (user.blocked) stats.blocked += 1;
+    return stats;
+  }, { total: 0, workers: 0, employers: 0, pending: 0, verified: 0, blocked: 0 }), [users]);
 
-  const loadUsers = async () => {
+  const loadUsers = async ({ silent = false } = {}) => {
     if (!token) return;
-    setBusy(true);
+    if (!silent) setUsersLoading(true);
     try {
-      const params = new URLSearchParams();
-      if (q) params.set('q', q);
-      if (roleFilter !== 'all') params.set('role', roleFilter);
-      if (statusFilter !== 'all') params.set('status', statusFilter);
-      const d = await api(`admin/users${params.toString() ? `?${params.toString()}` : ''}`, { token });
+      const d = await api('admin/users', { token });
       setUsers(d.users || []);
     } catch (e) {
       toast.error(e.message || 'Unable to load admin users');
     } finally {
-      setBusy(false);
+      if (!silent) setUsersLoading(false);
     }
   };
 
-  useEffect(() => { loadUsers(); }, [token, roleFilter, statusFilter]);
+  useEffect(() => { loadUsers(); }, [token]);
 
   const openDetails = async (user) => {
+    // Open immediately with the already-loaded list data, then refresh the
+    // richer details and messages in the background. This keeps the existing
+    // admin flow but removes the full-card loading delay.
     setSelected(user);
     setMessages([]);
     setAdminMessage('');
     setLoadingDetails(true);
     try {
-      const detail = await api(`admin/users/${user.id}`, { token });
-      const msg = await api(`admin/users/${user.id}/messages`, { token });
-      setSelected(detail.user || user);
+      const [detail, msg] = await Promise.all([
+        api(`admin/users/${user.id}`, { token }),
+        api(`admin/users/${user.id}/messages`, { token }),
+      ]);
+      setSelected((current) => current?.id === user.id ? (detail.user || current) : current);
       setMessages(msg.messages || []);
     } catch (e) {
       toast.error(e.message || 'Unable to load details');
@@ -1570,8 +1582,8 @@ function AdminApp({ auth, onLogout }) {
     setBusy(true);
     try {
       await api(`admin/users/${id}/block`, { method: 'PATCH', token, body: { blocked } });
+      setUsers((current) => current.map((user) => user.id === id ? { ...user, blocked } : user));
       toast.success(blocked ? 'User blocked' : 'User unblocked');
-      await loadUsers();
       if (selected?.id === id) setSelected((s) => ({ ...s, blocked }));
     } catch (e) { toast.error(e.message); } finally { setBusy(false); }
   };
@@ -1603,8 +1615,12 @@ function AdminApp({ auth, onLogout }) {
         };
       }
       await api(`admin/users/${id}/verify`, { method: 'PATCH', token, body });
+      setUsers((current) => current.map((user) => user.id === id ? {
+        ...user,
+        verified,
+        verification_status: verified ? 'verified' : 'rejected',
+      } : user));
       toast.success(verified ? 'Account verified' : 'Verification rejected');
-      await loadUsers();
       if (selected?.id === id) {
         const detail = await api(`admin/users/${id}`, { token });
         if (detail?.user) {
@@ -1718,7 +1734,6 @@ function AdminApp({ auth, onLogout }) {
           };
         });
       }
-      await loadUsers();
     } catch (e) {
       toast.error(e.message || 'Unable to verify section');
       try {
@@ -1749,38 +1764,43 @@ function AdminApp({ auth, onLogout }) {
     setBusy(true);
     try {
       await api(`admin/users/${id}`, { method: 'DELETE', token });
+      setUsers((current) => current.filter((user) => user.id !== id));
       toast.success('User deleted');
       setSelected(null);
-      await loadUsers();
     } catch (e) { toast.error(e.message); } finally { setBusy(false); }
   };
 
-  const localFiltered = users.filter((u) => {
-    const text = `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''}`.toLowerCase();
-    return text.includes(q.toLowerCase());
-  });
+  const localFiltered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return users.filter((u) => {
+      if (roleFilter !== 'all' && u.role !== roleFilter) return false;
+      if (statusFilter === 'blocked' && !u.blocked) return false;
+      if (statusFilter === 'verified' && !u.verified) return false;
+      if (statusFilter === 'pending' && !['submitted', 'pending'].includes(u.verification_status || '')) return false;
+      if (statusFilter === 'unverified' && u.verified) return false;
+      if (!needle) return true;
+      const text = `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase();
+      return text.includes(needle);
+    });
+  }, [users, q, roleFilter, statusFilter]);
 
   return (
-    <div className="w2w-admin-panel h-[100dvh] overflow-y-auto overflow-x-hidden bg-[radial-gradient(circle_at_top_left,_#dbeafe_0,_#f8fafc_34%,_#eef2ff_72%,_#f8fafc_100%)] text-slate-950">
-      <header className="sticky top-0 z-30 border-b border-white/60 bg-slate-950/95 text-white backdrop-blur-2xl shadow-2xl shadow-slate-950/20">
+    <div className="w2w-admin-panel h-[100dvh] overflow-y-auto overflow-x-hidden bg-gradient-to-br from-slate-50 via-blue-50/60 to-cyan-50/40 text-slate-950">
+      <header className="sticky top-0 z-30 border-b border-slate-800 bg-slate-950 text-white shadow-md">
         <div className="container py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
             <p className="text-xs font-bold text-sky-300 uppercase tracking-[0.18em]">Work2Wish Administration</p>
             <h1 className="text-2xl font-extrabold flex items-center gap-3 mt-1 text-white">
-              <motion.div
-                className="w-10 h-10 rounded-xl bg-blue-600 grid place-items-center text-white shadow-sm"
-                animate={{ scale: [1, 1.03, 1] }}
-                transition={{ duration: 2.5, repeat: Infinity }}
-              >
+              <div className="w-10 h-10 rounded-xl bg-blue-600 grid place-items-center text-white shadow-sm">
                 <ShieldCheck className="w-5 h-5" />
-              </motion.div>
+              </div>
               Admin Dashboard
             </h1>
             <p className="text-sm text-slate-300 mt-1">Manage users, verification requests, maintenance and account safety.</p>
           </div>
           <div className="flex gap-2 items-center">
             <NotificationCenter token={token} userId={auth?.profile?.id} channelKey="admin" accent="amber" />
-            <Button variant="outline" onClick={loadUsers} disabled={busy} className="border-white/20 bg-white/10 text-white hover:bg-white/20">{busy ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
+            <Button variant="outline" onClick={() => loadUsers()} disabled={usersLoading} className="border-white/20 bg-white/10 text-white hover:bg-white/20">{usersLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
             <Button onClick={onLogout} className="bg-slate-900 text-white hover:bg-slate-800 shadow-sm"><LogOut className="w-4 h-4 mr-2" /> Logout</Button>
           </div>
         </div>
@@ -1796,11 +1816,11 @@ function AdminApp({ auth, onLogout }) {
             ['Verified', adminStats.verified, 'text-emerald-600'],
             ['Blocked', adminStats.blocked, 'text-red-600'],
           ].map(([label, value, color]) => (
-            <motion.div key={label} whileHover={{ y: -2 }} transition={{ duration: 0.18 }}><Card className="overflow-hidden border border-white/70 bg-white/85 shadow-xl shadow-slate-200/70 backdrop-blur-xl hover:-translate-y-1 hover:shadow-2xl transition-all"><CardContent className="relative p-5"><p className="text-[11px] font-bold uppercase tracking-[0.12em] text-slate-500">{label}</p><p className={`mt-2 text-3xl font-extrabold ${color}`}>{value}</p></CardContent></Card></motion.div>
+            <Card key={label} className="overflow-hidden border border-slate-200 bg-white shadow-sm transition hover:-translate-y-0.5 hover:border-blue-200 hover:shadow-md"><CardContent className="relative p-5"><p className="text-[11px] font-bold uppercase tracking-[0.12em] text-slate-500">{label}</p><p className={`mt-2 text-3xl font-extrabold ${color}`}>{value}</p></CardContent></Card>
           ))}
         </div>
 
-        <Card className="border border-white/70 bg-white/85 shadow-xl shadow-slate-200/60 backdrop-blur-xl">
+        <Card className="border border-slate-200 bg-white shadow-sm">
           <CardContent className="p-3">
             <div className="grid sm:grid-cols-4 gap-2 rounded-2xl bg-slate-100/90 p-1.5">
               {[
@@ -1863,7 +1883,7 @@ function AdminApp({ auth, onLogout }) {
           <Card className="border-red-200 bg-red-50/70"><CardContent className="p-4 text-sm text-red-800">Block, unblock and delete controls are available in the user table and user details popup. Admin accounts are protected from these actions.</CardContent></Card>
         )}
 
-        {adminTab === 'users' && <Card className="overflow-hidden border border-white/80 bg-white/90 shadow-2xl shadow-slate-200/70 backdrop-blur-xl">
+        {adminTab === 'users' && <Card className="overflow-hidden border border-slate-200 bg-white shadow-lg">
           <CardHeader className="space-y-3">
             <div className="flex flex-col gap-3">
               <div>
@@ -1887,9 +1907,9 @@ function AdminApp({ auth, onLogout }) {
             </div>
           </CardHeader>
           <CardContent>
-            <div className="overflow-x-auto rounded-xl border border-slate-200">
-              <table className="w-full min-w-[1180px] table-fixed text-sm bg-white">
-                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+            <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
+              <table className="w-full min-w-[1120px] table-fixed text-sm bg-white">
+                <thead className="sticky top-0 z-10 bg-slate-100/95 text-slate-600 border-b border-slate-200">
                   <tr>
                     <th className="w-[250px] text-left p-3 whitespace-nowrap">User</th>
                     <th className="w-[110px] text-left p-3 whitespace-nowrap">Role</th>
@@ -1901,10 +1921,22 @@ function AdminApp({ auth, onLogout }) {
                   </tr>
                 </thead>
                 <tbody>
+                  {usersLoading && users.length === 0 && <tr><td colSpan="7" className="p-10 text-center text-slate-500"><Loader2 className="w-5 h-5 animate-spin inline-block mr-2" />Loading users…</td></tr>}
                   {localFiltered.map((u) => (
-                    <tr key={u.id} className="border-t border-slate-100 align-top transition hover:bg-blue-50/50">
-                      <td className="p-3 align-middle overflow-hidden"><p className="font-semibold">{u.full_name || u.company_name || 'No name'}</p><p className="text-xs text-muted-foreground">{u.email}</p>{u.company_name && <p className="text-xs text-muted-foreground">{u.company_name}</p>}</td>
-                      <td className="p-3 align-middle capitalize whitespace-nowrap"><Badge variant="secondary">{u.role}</Badge></td>
+                    <tr key={u.id} className="border-t border-slate-100 align-top transition-colors hover:bg-blue-50/70">
+                      <td className="p-3 align-middle overflow-hidden">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'admin' ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
+                            {String(u.full_name || u.company_name || u.email || 'U').trim().charAt(0).toUpperCase()}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-slate-900 truncate">{u.full_name || u.company_name || 'No name'}</p>
+                            <p className="text-xs text-slate-500 truncate">{u.email}</p>
+                            {u.company_name && u.full_name && <p className="text-xs text-slate-400 truncate">{u.company_name}</p>}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="p-3 align-middle capitalize whitespace-nowrap"><Badge className={u.role === 'employer' ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-100' : u.role === 'admin' ? 'bg-violet-100 text-violet-700 hover:bg-violet-100' : 'bg-blue-100 text-blue-700 hover:bg-blue-100'}>{u.role}</Badge></td>
                       <td className="p-3 align-middle whitespace-nowrap">{u.login_id || '—'}</td>
                       <td className="p-3 align-middle">
                         {u.role === 'worker' ? (
@@ -1944,7 +1976,7 @@ function AdminApp({ auth, onLogout }) {
                       </td>
                     </tr>
                   ))}
-                  {localFiltered.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-muted-foreground">No users found.</td></tr>}
+                  {!usersLoading && localFiltered.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-muted-foreground">No users found.</td></tr>}
                 </tbody>
               </table>
             </div>
@@ -1958,8 +1990,13 @@ function AdminApp({ auth, onLogout }) {
             <DialogTitle>{selected?.full_name || selected?.company_name || selected?.email || 'User details'}</DialogTitle>
             <DialogDescription>Review account information, documents, verification status and administrative actions.</DialogDescription>
           </DialogHeader>
-          {loadingDetails ? <div className="py-10 grid place-items-center"><Loader2 className="w-6 h-6 animate-spin" /></div> : selected && (
+          {selected && (
             <div className="space-y-5">
+              {loadingDetails && (
+                <div className="flex items-center gap-2 rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Refreshing latest account details…
+                </div>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <InfoTile label="Email" value={selected.email} />
                 <InfoTile label="Role" value={selected.role} />
@@ -1967,13 +2004,15 @@ function AdminApp({ auth, onLogout }) {
                 <InfoTile label="Phone" value={selected.phone} />
                 <InfoTile label="Location" value={selected.location_text} />
                 <InfoTile label="Account status" value={selected.verified ? 'Verified account' : (selected.verification_status || 'Not submitted')} />
+                <InfoTile label="Created" value={selected.created_at ? new Date(selected.created_at).toLocaleString() : '—'} />
+                <InfoTile label="Last updated" value={selected.updated_at ? new Date(selected.updated_at).toLocaleString() : '—'} />
               </div>
 
               {(() => {
                 const canFinalVerify = adminRequiredSectionsDone;
                 const verificationTitle = selected.role === 'worker' ? 'Worker Verification' : 'Employer Verification';
                 return (
-                  <div className="grid lg:grid-cols-3 gap-4">
+                  <div className="grid lg:grid-cols-2 gap-4">
                     <AdminVerificationSection
                       title="Profile"
                       tone="indigo"
@@ -1983,15 +2022,43 @@ function AdminApp({ auth, onLogout }) {
                       onVerify={() => verifySection('profile')}
                       disabled={busy || selected.role === 'admin'}
                     >
-                      <InfoTile label="Name" value={selected.full_name || selected.company_name} />
-                      <InfoTile label="Phone" value={selected.phone} />
-                      <InfoTile label="Address" value={selected.role === 'employer' ? selected.company_address : selected.address} />
-                      <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
-                      {selected.role === 'worker' && <InfoTile label="Skills" value={(selected.skills || []).join(', ')} />}
-                      {selected.role === 'worker' && <InfoTile label="Experience" value={`${selected.experience_years || 0} years · ${selected.experience_level || '—'}`} />}
-                      {selected.role === 'employer' && <InfoTile label="Company" value={selected.company_name} />}
-                      {selected.role === 'employer' && <InfoTile label="Industry" value={selected.industry} />}
-                      {selected.role === 'employer' && <InfoTile label="HR contact" value={selected.hr_contact || selected.official_email} />}
+                      {selected.role === 'worker' ? (
+                        <div className="grid gap-3">
+                          <div className="grid sm:grid-cols-2 gap-3">
+                            <InfoTile label="Full name" value={selected.full_name} />
+                            <InfoTile label="Login email" value={selected.email} />
+                            <InfoTile label="Phone" value={selected.phone} />
+                            <InfoTile label="Login ID" value={selected.login_id} />
+                            <InfoTile label="Age" value={selected.age} />
+                            <InfoTile label="Gender" value={selected.gender} />
+                            <InfoTile label="Address" value={selected.address} />
+                            <InfoTile label="Saved work location" value={selected.location_text || selected.place_name} />
+                            <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
+                            <InfoTile label="Skills" value={Array.isArray(selected.skills) ? selected.skills.join(', ') : selected.skills} />
+                            <InfoTile label="Experience years" value={selected.experience_years !== undefined && selected.experience_years !== null ? `${selected.experience_years} years` : '—'} />
+                            <InfoTile label="Experience level" value={selected.experience_level} />
+                            <InfoTile label="Expected daily wage" value={selected.expected_daily_wage ? `₹${selected.expected_daily_wage}` : '—'} />
+                            <InfoTile label="Languages known" value={Array.isArray(selected.languages_known) ? selected.languages_known.join(', ') : selected.languages_known} />
+                            <InfoTile label="Availability" value={selected.available === false ? 'Not available' : 'Available'} />
+                            <InfoTile label="Previous employer reference" value={selected.previous_employer_reference} />
+                          </div>
+                          <InfoTile label="Bio / about worker" value={selected.bio} />
+                          <div className="grid sm:grid-cols-2 gap-3">
+                            <AdminDocPreview title="Profile photo" url={selected.photo_url || selected.profile_photo_url || selected.profile_image_url} />
+                            <AdminDocPreview title="Resume" url={selected.resume_url} />
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <InfoTile label="Name" value={selected.full_name || selected.company_name} />
+                          <InfoTile label="Phone" value={selected.phone} />
+                          <InfoTile label="Address" value={selected.company_address} />
+                          <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
+                          <InfoTile label="Company" value={selected.company_name} />
+                          <InfoTile label="Industry" value={selected.industry} />
+                          <InfoTile label="HR contact" value={selected.hr_contact || selected.official_email} />
+                        </>
+                      )}
                     </AdminVerificationSection>
 
                     {adminUserRole === 'worker' && (
@@ -2014,7 +2081,8 @@ function AdminApp({ auth, onLogout }) {
                       </AdminVerificationSection>
                     )}
 
-                    <AdminVerificationSection
+                    <div className={adminUserRole === 'worker' ? 'lg:col-span-2' : ''}>
+                      <AdminVerificationSection
                       title={verificationTitle}
                       tone="amber"
                       icon={<ShieldCheck className="w-4 h-4" />}
@@ -2044,6 +2112,7 @@ function AdminApp({ auth, onLogout }) {
                         </div>
                       )}
                     </AdminVerificationSection>
+                    </div>
                   </div>
                 );
               })()}
@@ -3398,6 +3467,215 @@ function FreeProTrialDialog({ role = 'worker', trial, onOpenSubscription, onClos
   );
 }
 
+
+const ENGAGEMENT_NOTIFICATIONS = [
+  { role:'worker', title:'Fresh jobs are waiting', message:'Open Work2Wish and check today’s opportunities near you.', target:'home' },
+  { role:'worker', title:'Your next job could be one tap away', message:'Browse new openings and apply before positions fill.', target:'home' },
+  { role:'worker', title:'Keep your profile job-ready', message:'Updated skills and experience help employers understand you faster.', target:'profile' },
+  { role:'worker', title:'A complete profile builds trust', message:'Review your Work2Wish profile and keep every detail current.', target:'profile' },
+  { role:'worker', title:'New day, new opportunity', message:'Take a quick look at available jobs and find your next move.', target:'home' },
+  { role:'worker', title:'Employers notice active profiles', message:'Keep your availability and skills updated so you are ready when work appears.', target:'profile' },
+  { role:'worker', title:'Don’t miss a good match', message:'Check Work2Wish for jobs that fit your skills today.', target:'home' },
+  { role:'worker', title:'Ready to work?', message:'Browse openings, review pay and location, and apply to the right job.', target:'home' },
+  { role:'worker', title:'Your skills deserve visibility', message:'Add accurate skills and experience to strengthen your profile.', target:'profile' },
+  { role:'worker', title:'Stay ready for replies', message:'Check your chats for employer or Admin updates.', target:'chats' },
+  { role:'worker', title:'A quick profile check helps', message:'Confirm your phone, location and work details are still correct.', target:'profile' },
+  { role:'worker', title:'Opportunities move fast', message:'Open the job feed and apply early to suitable openings.', target:'home' },
+  { role:'worker', title:'Build your Work2Wish journey', message:'Every completed job and good review can strengthen your future opportunities.', target:'myjobs' },
+  { role:'worker', title:'Check your applications', message:'See whether any employer has moved your application forward.', target:'myjobs' },
+  { role:'worker', title:'Stay connected', message:'A quick reply in chat can keep a hiring conversation moving.', target:'chats' },
+  { role:'worker', title:'Your profile works for you', message:'Keep it complete so employers see the right information.', target:'profile' },
+  { role:'worker', title:'Find work that fits', message:'Compare location, pay and requirements before you apply.', target:'home' },
+  { role:'worker', title:'Today could bring a new lead', message:'Check available jobs and stay active on Work2Wish.', target:'home' },
+  { role:'worker', title:'Keep your documents ready', message:'Review your profile verification status so nothing blocks your next step.', target:'profile' },
+  { role:'worker', title:'Small updates matter', message:'A current profile can make your job search smoother.', target:'profile' },
+  { role:'worker', title:'Check before the shift', message:'If you are hired, review your job details and attendance requirements.', target:'myjobs' },
+  { role:'worker', title:'Work smart today', message:'Use Work2Wish to keep jobs, chats and attendance in one place.', target:'myjobs' },
+  { role:'worker', title:'One more job check?', message:'There may be a suitable opening you have not seen yet.', target:'home' },
+  { role:'worker', title:'Your availability matters', message:'Keep your work availability current for better employer decisions.', target:'profile' },
+  { role:'worker', title:'Stay ahead of updates', message:'Open notifications and chats regularly so you do not miss an employer response.', target:'chats' },
+  { role:'worker', title:'Good profiles get noticed faster', message:'Make sure your skills, experience and location are complete.', target:'profile' },
+  { role:'worker', title:'Your next employer may be browsing', message:'Keep your profile polished and ready to view.', target:'profile' },
+  { role:'worker', title:'Make today count', message:'Explore jobs that match your experience and preferred location.', target:'home' },
+  { role:'worker', title:'Track your progress', message:'Review pending, accepted and ongoing jobs from My Jobs.', target:'myjobs' },
+  { role:'worker', title:'A fast reply can help', message:'Check Chats for new questions from employers.', target:'chats' },
+  { role:'worker', title:'Profile check-in', message:'Complete missing details now so you are ready when the right job appears.', target:'profile' },
+  { role:'worker', title:'See what’s open nearby', message:'Browse the latest job opportunities and compare what works for you.', target:'home' },
+  { role:'worker', title:'Build a stronger work history', message:'Complete jobs carefully and keep your Work2Wish record growing.', target:'myjobs' },
+  { role:'worker', title:'Stay verified, stay ready', message:'Review any pending verification updates in your profile.', target:'profile' },
+  { role:'worker', title:'Don’t leave opportunities waiting', message:'Check your applications and chats for movement today.', target:'myjobs' },
+  { role:'worker', title:'Your next step starts here', message:'Open the jobs page and look for a role that matches your skills.', target:'home' },
+  { role:'worker', title:'Keep contact details current', message:'Make sure employers can reach you using the information in your profile.', target:'profile' },
+  { role:'worker', title:'Ready for the next shift?', message:'Review ongoing work and attendance before reporting.', target:'myjobs' },
+  { role:'worker', title:'Look once more', message:'New openings can appear anytime. Check Work2Wish before you move on.', target:'home' },
+  { role:'worker', title:'Grow with every opportunity', message:'Keep building experience, ratings and trusted work history.', target:'myjobs' },
+  { role:'worker', title:'Make your skills clear', message:'Specific, accurate skills help employers understand where you fit.', target:'profile' },
+  { role:'worker', title:'Keep the conversation moving', message:'Open Chats and respond to employer or Admin messages.', target:'chats' },
+  { role:'worker', title:'A complete profile saves time', message:'Fill missing details now so applications are easier later.', target:'profile' },
+  { role:'worker', title:'Check your job status', message:'See whether a pending application has changed.', target:'myjobs' },
+  { role:'worker', title:'Your opportunity feed is ready', message:'Browse jobs and choose only the work that suits you.', target:'home' },
+  { role:'worker', title:'Be ready before you apply', message:'Review profile, location and documents for a smoother hiring flow.', target:'profile' },
+  { role:'worker', title:'Stay active, stay visible', message:'A quick Work2Wish check keeps you close to new opportunities.', target:'home' },
+  { role:'worker', title:'Turn experience into opportunity', message:'Keep your work experience updated for employers to review.', target:'profile' },
+  { role:'worker', title:'One app, your work journey', message:'Jobs, chats, attendance and progress are ready when you need them.', target:'myjobs' },
+  { role:'worker', title:'Your next opportunity may be live', message:'Take a minute to browse Work2Wish now.', target:'home' },
+  { role:'employer', title:'Your next hire could be here', message:'Review active jobs and see who has applied.', target:'dashboard' },
+  { role:'employer', title:'Strong teams start with clear jobs', message:'Keep job titles, pay, location and requirements accurate.', target:'post' },
+  { role:'employer', title:'Applicants may be waiting', message:'Open your job posts and review new candidates.', target:'dashboard' },
+  { role:'employer', title:'Keep your company profile complete', message:'A clear company profile helps workers trust the opportunity.', target:'profile' },
+  { role:'employer', title:'Hiring moves faster with replies', message:'Check Chats and respond to promising candidates.', target:'chats' },
+  { role:'employer', title:'Ready to grow your team?', message:'Post a new job with clear requirements and start receiving applications.', target:'post' },
+  { role:'employer', title:'Check today’s candidate activity', message:'Review applications across your active Work2Wish jobs.', target:'dashboard' },
+  { role:'employer', title:'Your company details matter', message:'Keep HR contact, location and company information current.', target:'profile' },
+  { role:'employer', title:'Good job posts attract better matches', message:'Use clear pay, timing, skills and location details.', target:'post' },
+  { role:'employer', title:'Don’t keep candidates waiting', message:'Review pending applications and update the right people quickly.', target:'dashboard' },
+  { role:'employer', title:'A quick chat can speed up hiring', message:'Open Chats to answer candidate questions and share next steps.', target:'chats' },
+  { role:'employer', title:'Build a trusted employer profile', message:'Complete your company details and keep verification information current.', target:'profile' },
+  { role:'employer', title:'New applicants can arrive anytime', message:'Check your active job cards for fresh interest.', target:'dashboard' },
+  { role:'employer', title:'Make the opportunity easy to understand', message:'Clear job descriptions help the right workers apply.', target:'post' },
+  { role:'employer', title:'Your hiring dashboard is ready', message:'Review jobs, applicants and hiring progress in one place.', target:'dashboard' },
+  { role:'employer', title:'Stay responsive', message:'Fast communication helps serious applicants stay engaged.', target:'chats' },
+  { role:'employer', title:'Profile check-in', message:'Confirm company logo, HR contact and official details are complete.', target:'profile' },
+  { role:'employer', title:'Need more hands?', message:'Post a job and specify exactly how many workers you need.', target:'post' },
+  { role:'employer', title:'Review before you shortlist', message:'Compare candidate profiles, skills and verification status.', target:'dashboard' },
+  { role:'employer', title:'Keep hiring organized', message:'Use Work2Wish to track applicants from application to active work.', target:'dashboard' },
+  { role:'employer', title:'Your company logo builds recognition', message:'Make sure your profile logo is current and professional.', target:'profile' },
+  { role:'employer', title:'Check your hiring conversations', message:'A candidate may have replied since your last visit.', target:'chats' },
+  { role:'employer', title:'Post with confidence', message:'Accurate pay and work details reduce unnecessary back-and-forth.', target:'post' },
+  { role:'employer', title:'Keep your workforce moving', message:'Review hired workers, attendance and ongoing jobs.', target:'hired' },
+  { role:'employer', title:'A complete profile creates trust', message:'Workers can understand your company better when public details are filled.', target:'profile' },
+  { role:'employer', title:'Hiring opportunity check', message:'Open your dashboard and review today’s applicant activity.', target:'dashboard' },
+  { role:'employer', title:'Find the right fit, not just a fast fit', message:'Review skills, experience and availability before confirming.', target:'dashboard' },
+  { role:'employer', title:'Keep job information fresh', message:'Update active job details if timing, location or requirements change.', target:'dashboard' },
+  { role:'employer', title:'Ready for the next hire?', message:'Create a clear opening and let Work2Wish bring candidates to you.', target:'post' },
+  { role:'employer', title:'Candidates value clarity', message:'Use chat to share reporting time, site contact and next steps.', target:'chats' },
+  { role:'employer', title:'Stay on top of attendance', message:'Review ongoing worker attendance and job execution.', target:'hired' },
+  { role:'employer', title:'Your HR contact should be reachable', message:'Confirm the profile shows the correct HR name and mobile number.', target:'profile' },
+  { role:'employer', title:'Don’t miss a promising applicant', message:'Take a quick look at pending applications now.', target:'dashboard' },
+  { role:'employer', title:'Build stronger hiring history', message:'Complete jobs and feedback to strengthen future hiring decisions.', target:'hired' },
+  { role:'employer', title:'One clear post can find the right worker', message:'Describe the role simply, accurately and completely.', target:'post' },
+  { role:'employer', title:'Your hiring pipeline needs a quick look', message:'Review what is pending, selected and ongoing.', target:'dashboard' },
+  { role:'employer', title:'Keep the candidate experience smooth', message:'Reply clearly and keep selected workers updated.', target:'chats' },
+  { role:'employer', title:'Company profile reminder', message:'Review your official email, address, industry and HR contact.', target:'profile' },
+  { role:'employer', title:'Check active work', message:'See hired workers and attendance before the day moves on.', target:'hired' },
+  { role:'employer', title:'A better post means better matching', message:'Add useful skills and realistic work details before publishing.', target:'post' },
+  { role:'employer', title:'Your next team member may have applied', message:'Open the dashboard and review fresh candidates.', target:'dashboard' },
+  { role:'employer', title:'Keep Work2Wish working for your team', message:'Maintain accurate jobs, company details and communication.', target:'dashboard' },
+  { role:'employer', title:'Hiring follow-up time', message:'Check Chats for candidate replies and questions.', target:'chats' },
+  { role:'employer', title:'Profile accuracy builds confidence', message:'Keep company and contact details updated for workers.', target:'profile' },
+  { role:'employer', title:'Review selected workers', message:'Check who has accepted and what work is currently ongoing.', target:'hired' },
+  { role:'employer', title:'Make your next opening count', message:'Post complete job details so candidates can decide quickly.', target:'post' },
+  { role:'employer', title:'A quick review can find a great fit', message:'See who applied and compare the profiles that match your need.', target:'dashboard' },
+  { role:'employer', title:'Stay connected with your workforce', message:'Use Work2Wish chats and updates to keep work moving smoothly.', target:'chats' },
+  { role:'employer', title:'Your hiring workspace is ready', message:'Jobs, applicants, hires and attendance are all available in Work2Wish.', target:'dashboard' },
+  { role:'employer', title:'Build your team today', message:'Check applicants or publish a new opening when you need more people.', target:'dashboard' },
+];
+
+function profileCompletionState(role, me) {
+  const profile = me?.profile || {};
+  const extra = me?.extra || {};
+  if (role === 'employer') {
+    const checks = [
+      ['Your name', profile.full_name], ['Phone number', profile.phone], ['Company name', extra.company_name],
+      ['Industry', extra.industry], ['Company size', extra.company_size], ['HR contact person', extra.hr_contact],
+      ['Official email', extra.official_email], ['Company address', extra.company_address], ['Company GPS location', extra.location_text],
+      ['About company', extra.description], ['Company logo', extra.company_logo || extra.company_logo_url || profile.photo_url],
+    ];
+    const missing = checks.filter(([,v]) => !String(v ?? '').trim()).map(([label]) => label);
+    return { complete: missing.length === 0, missing, total: checks.length };
+  }
+  const skills = Array.isArray(extra.skills) ? extra.skills : String(extra.skills || '').split(',').filter(Boolean);
+  const languages = Array.isArray(extra.languages_known) ? extra.languages_known : String(extra.languages_known || '').split(',').filter(Boolean);
+  const checks = [
+    ['Full name', profile.full_name], ['Phone number', profile.phone], ['Age', extra.age], ['Gender', extra.gender],
+    ['Skills', skills.length], ['Experience', extra.experience_years || extra.experience_level], ['Expected wage', extra.expected_daily_wage],
+    ['Languages', languages.length], ['Work location', extra.location_text], ['Bio', extra.bio], ['Profile photo', profile.photo_url || extra.photo_url],
+  ];
+  const missing = checks.filter(([,v]) => !String(v ?? '').trim() || v === 0).map(([label]) => label);
+  return { complete: missing.length === 0, missing, total: checks.length };
+}
+
+function ProfileCompletionReminder({ role, me, currentTab, onOpenProfile }) {
+  const [open, setOpen] = useState(false);
+  const state = useMemo(() => profileCompletionState(role, me), [role, me]);
+  const userKey = me?.profile?.id || me?.profile?.email || 'current';
+
+  useEffect(() => {
+    if (!me?.profile || state.complete || currentTab === 'profile') return undefined;
+    const storageKey = `w2w-profile-reminder-${role}-${userKey}`;
+    const maybeShow = () => {
+      if (document.visibilityState !== 'visible' || currentTab === 'profile') return;
+      const last = Number(localStorage.getItem(storageKey) || 0);
+      if (Date.now() - last < 15 * 60 * 1000) return;
+      localStorage.setItem(storageKey, String(Date.now()));
+      setOpen(true);
+    };
+    const first = setTimeout(maybeShow, 45000);
+    const repeat = setInterval(maybeShow, 15 * 60 * 1000);
+    return () => { clearTimeout(first); clearInterval(repeat); };
+  }, [role, userKey, me?.profile, state.complete, currentTab]);
+
+  if (state.complete) return null;
+  const completed = Math.max(0, state.total - state.missing.length);
+  const percent = Math.round((completed / state.total) * 100);
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent className="sm:max-w-md rounded-3xl border border-sky-100 bg-white shadow-2xl">
+        <DialogHeader>
+          <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white grid place-items-center mb-2 shadow-lg"><UserCircle className="w-6 h-6" /></div>
+          <DialogTitle className="text-xl">Complete your profile</DialogTitle>
+          <DialogDescription>A complete Work2Wish profile helps you use the platform smoothly and keeps your account ready for the next step.</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="flex items-center justify-between text-sm"><span className="font-semibold text-slate-700">Profile completion</span><span className="font-extrabold text-sky-700">{percent}%</span></div>
+          <div className="h-2.5 rounded-full bg-slate-100 overflow-hidden"><div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-600 transition-all" style={{ width: `${percent}%` }} /></div>
+          <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3 text-sm text-slate-700">
+            <p className="font-bold text-slate-900 mb-1">Still missing</p>
+            <p>{state.missing.slice(0, 5).join(' · ')}{state.missing.length > 5 ? ` · +${state.missing.length - 5} more` : ''}</p>
+          </div>
+        </div>
+        <DialogFooter className="gap-2 sm:gap-2">
+          <Button type="button" variant="outline" onClick={() => setOpen(false)}>Later</Button>
+          <Button type="button" onClick={() => { setOpen(false); onOpenProfile?.(); }} className="bg-sky-600 hover:bg-sky-700"><UserCircle className="w-4 h-4 mr-2" /> Complete Profile</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function EngagementNudges({ role, userId, onNavigate }) {
+  const navigateRef = useRef(onNavigate);
+  useEffect(() => { navigateRef.current = onNavigate; }, [onNavigate]);
+  useEffect(() => {
+    if (!role || !userId || typeof window === 'undefined') return undefined;
+    const pool = ENGAGEMENT_NOTIFICATIONS.filter((item) => item.role === role);
+    if (!pool.length) return undefined;
+    const storageKey = `w2w-engagement-nudge-${role}-${userId}`;
+    let timer;
+    const schedule = (first = false) => {
+      const delay = first ? 90000 : (12 + Math.floor(Math.random() * 9)) * 60 * 1000;
+      timer = setTimeout(() => {
+        if (document.visibilityState === 'visible') {
+          const lastIndex = Number(localStorage.getItem(storageKey) || -1);
+          let nextIndex = Math.floor(Math.random() * pool.length);
+          if (pool.length > 1 && nextIndex === lastIndex) nextIndex = (nextIndex + 1) % pool.length;
+          localStorage.setItem(storageKey, String(nextIndex));
+          const item = pool[nextIndex];
+          toast(item.title, {
+            description: item.message,
+            duration: 9000,
+            action: { label: item.target === 'profile' ? 'Open Profile' : item.target === 'chats' ? 'Open Chats' : item.target === 'post' ? 'Post Job' : item.target === 'hired' || item.target === 'myjobs' ? 'View Work' : 'View Now', onClick: () => navigateRef.current?.(item.target) },
+          });
+        }
+        schedule(false);
+      }, delay);
+    };
+    schedule(true);
+    return () => clearTimeout(timer);
+  }, [role, userId]);
+  return null;
+}
+
 function WorkerApp({ auth, onLogout }) {
   const token = auth?.session?.access_token;
   const [tab, setTabState] = useState('home'); // home | myjobs | chats | profile
@@ -3517,6 +3795,8 @@ function WorkerApp({ auth, onLogout }) {
 
   return (
     <div className="w2w-dashboard-shell h-[100dvh] max-h-[100dvh] bg-slate-50 overflow-hidden flex flex-col">
+      <ProfileCompletionReminder role="worker" me={me} currentTab={tab} onOpenProfile={() => setTab('profile')} />
+      <EngagementNudges role="worker" userId={me?.profile?.id} onNavigate={(target) => setTab(target || 'home')} />
       {/* top bar — premium */}
       <header className="bg-gradient-to-r from-[#04112f] via-[#071f55] to-[#0b3b91] backdrop-blur-xl border-b border-blue-400/20 shrink-0 z-10 shadow-[0_10px_34px_rgba(7,31,85,0.30)]">
         <div className="container py-2.5 flex items-center justify-between gap-3">
@@ -8091,6 +8371,8 @@ function EmployerApp({ auth, onLogout }) {
 
   return (
     <div className="w2w-dashboard-shell h-[100dvh] max-h-[100dvh] bg-slate-50 overflow-hidden flex flex-col">
+      <ProfileCompletionReminder role="employer" me={me} currentTab={tab} onOpenProfile={() => setTab('profile')} />
+      <EngagementNudges role="employer" userId={me?.profile?.id} onNavigate={(target) => setTab(target || 'dashboard')} />
       <header className="bg-gradient-to-r from-[#04112f] via-[#071f55] to-[#0b3b91] backdrop-blur-xl border-b border-blue-400/20 shrink-0 z-10 shadow-[0_10px_34px_rgba(7,31,85,0.30)]">
         <div className="container py-2.5 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">

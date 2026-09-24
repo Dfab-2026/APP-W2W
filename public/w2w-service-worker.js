@@ -5,8 +5,8 @@ self.addEventListener('push', (event) => {
   const title = data.title || 'Work2Wish';
   const options = {
     body: data.body || 'You have a new Work2Wish update',
-    icon: '/icon-192.png',
-    badge: '/icon-192.png',
+    icon: '/work2wish-logo.png',
+    badge: '/work2wish-logo.png',
     data: { url: data.url || '/', type: data.type || 'update', related_id: data.related_id || null },
     vibrate: [100, 50, 100],
     tag: data.type || 'work2wish-update',
