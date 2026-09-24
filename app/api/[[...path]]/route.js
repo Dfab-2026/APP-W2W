@@ -610,9 +610,10 @@ async function route(request, { params }) {
     // ---------- AUTH ----------
     // STEP 1: send OTP. We hold the pending signup data in otp_codes.payload.
     if (path === 'auth/send-otp' && method === 'POST') {
-      const { email: rawEmail, password, role, full_name } = await request.json();
+      const { email: rawEmail, password, role, full_name, phone: rawPhone } = await request.json();
+      const phone = normalizePhone(rawPhone);
       const email = String(rawEmail || '').trim().toLowerCase();
-      if (!email || !password || !role) return err('email, password, role required', 400);
+      if (!email || !password || !role || !phone) return err('email, mobile number, password, role required', 400);
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err('Enter a valid email address', 400);
       if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
 
@@ -631,7 +632,7 @@ async function route(request, { params }) {
 
       const { error: insErr } = await admin.from('otp_codes').insert({
         email, code, expires_at,
-        payload: { role, full_name, password },
+        payload: { role, full_name, phone, password },
       });
       if (insErr) return err(insErr.message, 400);
 
@@ -668,7 +669,7 @@ async function route(request, { params }) {
       // Mark consumed
       await admin.from('otp_codes').update({ consumed: true }).eq('id', row.id);
 
-      const { role, full_name, password } = row.payload || {};
+      const { role, full_name, phone, password } = row.payload || {};
       // Create user
       const { data: created, error: cErr } = await admin.auth.admin.createUser({
         email, password, email_confirm: true,
@@ -683,6 +684,7 @@ async function route(request, { params }) {
         email,
         role,
         full_name: full_name || null,
+        phone: phone || null,
         login_id,
       });
       if (role === 'worker') {
@@ -810,8 +812,9 @@ async function route(request, { params }) {
 
     // Legacy direct signup kept for backwards compat (auto-confirm)
     if (path === 'auth/signup' && method === 'POST') {
-      const { email, password, role, full_name } = await request.json();
-      if (!email || !password || !role) return err('email, password, role required', 400);
+      const { email, password, role, full_name, phone: rawPhone } = await request.json();
+      const phone = normalizePhone(rawPhone);
+      if (!email || !password || !role || !phone) return err('email, mobile number, password, role required', 400);
       if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
 
       const { data: created, error: cErr } = await admin.auth.admin.createUser({
@@ -822,7 +825,7 @@ async function route(request, { params }) {
       const user = created.user;
       const login_id = await generateLoginId(admin);
       await admin.from('user_profiles').insert({
-        id: user.id, email, role, full_name: full_name || null, login_id,
+        id: user.id, email, phone, role, full_name: full_name || null, login_id,
       });
       if (role === 'worker') await admin.from('workers').insert({ user_id: user.id });
       else                   await admin.from('employers').insert({ user_id: user.id });
@@ -871,9 +874,10 @@ async function route(request, { params }) {
 
     // Google signup OTP: used when a new Google user completes the normal Create Account flow.
     if (path === 'auth/google-send-otp' && method === 'POST') {
-      const { email, password, role, full_name, google_access_token } = await request.json();
-      if (!email || !password || !role || !google_access_token) {
-        return err('email, password, role, google_access_token required', 400);
+      const { email, password, role, full_name, phone: rawPhone, google_access_token } = await request.json();
+      const phone = normalizePhone(rawPhone);
+      if (!email || !password || !role || !phone || !google_access_token) {
+        return err('email, mobile number, password, role, google_access_token required', 400);
       }
       if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
 
@@ -899,6 +903,7 @@ async function route(request, { params }) {
           user_id: u.user.id,
           role,
           full_name,
+          phone,
           password,
           photo_url: u.user.user_metadata?.avatar_url || u.user.user_metadata?.picture || null,
         },
@@ -942,7 +947,7 @@ async function route(request, { params }) {
 
       await admin.from('otp_codes').update({ consumed: true }).eq('id', row.id);
 
-      const { user_id, role, full_name, password, photo_url } = row.payload || {};
+      const { user_id, role, full_name, phone, password, photo_url } = row.payload || {};
 
       const { error: updateErr } = await admin.auth.admin.updateUserById(user_id, {
         password,
@@ -958,6 +963,7 @@ async function route(request, { params }) {
         email,
         role,
         full_name: full_name || null,
+        phone: phone || null,
         photo_url: photo_url || null,
         login_id,
       });
@@ -984,7 +990,7 @@ async function route(request, { params }) {
         session: signed.session,
         role,
         login_id,
-        profile: { id: user_id, email, role, full_name, photo_url, login_id },
+        profile: { id: user_id, email, phone, role, full_name, photo_url, login_id },
       });
     }
 
@@ -1021,20 +1027,108 @@ async function route(request, { params }) {
       if (!cronSecret || authorization !== `Bearer ${cronSecret}`) return err('Unauthorized', 401);
 
       const workerMessages = [
-        ['Fresh jobs are waiting', 'Open Work2Wish and check today’s opportunities near you.'],
-        ['Stay ready for replies', 'Check your chats for employer or Admin updates.'],
-        ['Keep your profile job-ready', 'Updated skills and experience help employers understand you faster.'],
-        ['Check your applications', 'See whether any employer has moved your application forward.'],
-        ['Your next opportunity may be waiting', 'Open Work2Wish and review suitable jobs when you have a moment.'],
-        ['Keep your documents ready', 'Review your verification status so nothing blocks your next step.'],
+        ["Fresh jobs are waiting", "Open Work2Wish and check today’s opportunities near you."],
+        ["Your next job could be one tap away", "Browse new openings and apply before positions fill."],
+        ["Keep your profile job-ready", "Updated skills and experience help employers understand you faster."],
+        ["A complete profile builds trust", "Review your Work2Wish profile and keep every detail current."],
+        ["New day, new opportunity", "Take a quick look at available jobs and find your next move."],
+        ["Employers notice active profiles", "Keep your availability and skills updated so you are ready when work appears."],
+        ["Don’t miss a good match", "Check Work2Wish for jobs that fit your skills today."],
+        ["Ready to work?", "Browse openings, review pay and location, and apply to the right job."],
+        ["Your skills deserve visibility", "Add accurate skills and experience to strengthen your profile."],
+        ["Stay ready for replies", "Check your chats for employer or Admin updates."],
+        ["A quick profile check helps", "Confirm your phone, location and work details are still correct."],
+        ["Opportunities move fast", "Open the job feed and apply early to suitable openings."],
+        ["Build your Work2Wish journey", "Every completed job and good review can strengthen your future opportunities."],
+        ["Check your applications", "See whether any employer has moved your application forward."],
+        ["Stay connected", "A quick reply in chat can keep a hiring conversation moving."],
+        ["Your profile works for you", "Keep it complete so employers see the right information."],
+        ["Find work that fits", "Compare location, pay and requirements before you apply."],
+        ["Today could bring a new lead", "Check available jobs and stay active on Work2Wish."],
+        ["Keep your documents ready", "Review your profile verification status so nothing blocks your next step."],
+        ["Small updates matter", "A current profile can make your job search smoother."],
+        ["Check before the shift", "If you are hired, review your job details and attendance requirements."],
+        ["Work smart today", "Use Work2Wish to keep jobs, chats and attendance in one place."],
+        ["One more job check?", "There may be a suitable opening you have not seen yet."],
+        ["Your availability matters", "Keep your work availability current for better employer decisions."],
+        ["Stay ahead of updates", "Open notifications and chats regularly so you do not miss an employer response."],
+        ["Good profiles get noticed faster", "Make sure your skills, experience and location are complete."],
+        ["Your next employer may be browsing", "Keep your profile polished and ready to view."],
+        ["Make today count", "Explore jobs that match your experience and preferred location."],
+        ["Track your progress", "Review pending, accepted and ongoing jobs from My Jobs."],
+        ["A fast reply can help", "Check Chats for new questions from employers."],
+        ["Profile check-in", "Complete missing details now so you are ready when the right job appears."],
+        ["See what’s open nearby", "Browse the latest job opportunities and compare what works for you."],
+        ["Build a stronger work history", "Complete jobs carefully and keep your Work2Wish record growing."],
+        ["Stay verified, stay ready", "Review any pending verification updates in your profile."],
+        ["Don’t leave opportunities waiting", "Check your applications and chats for movement today."],
+        ["Your next step starts here", "Open the jobs page and look for a role that matches your skills."],
+        ["Keep contact details current", "Make sure employers can reach you using the information in your profile."],
+        ["Ready for the next shift?", "Review ongoing work and attendance before reporting."],
+        ["Look once more", "New openings can appear anytime. Check Work2Wish before you move on."],
+        ["Grow with every opportunity", "Keep building experience, ratings and trusted work history."],
+        ["Make your skills clear", "Specific, accurate skills help employers understand where you fit."],
+        ["Keep the conversation moving", "Open Chats and respond to employer or Admin messages."],
+        ["A complete profile saves time", "Fill missing details now so applications are easier later."],
+        ["Check your job status", "See whether a pending application has changed."],
+        ["Your opportunity feed is ready", "Browse jobs and choose only the work that suits you."],
+        ["Be ready before you apply", "Review profile, location and documents for a smoother hiring flow."],
+        ["Stay active, stay visible", "A quick Work2Wish check keeps you close to new opportunities."],
+        ["Turn experience into opportunity", "Keep your work experience updated for employers to review."],
+        ["One app, your work journey", "Jobs, chats, attendance and progress are ready when you need them."],
+        ["Your next opportunity may be live", "Take a minute to browse Work2Wish now."],
       ];
       const employerMessages = [
-        ['Your next candidate may be waiting', 'Open Work2Wish and review recent applicants.'],
-        ['Hiring follow-up time', 'Check Chats for candidate replies and questions.'],
-        ['Keep your company profile current', 'Accurate company and HR details help workers trust your openings.'],
-        ['Review your hiring pipeline', 'Check pending, selected and ongoing workers in Work2Wish.'],
-        ['Ready to hire?', 'Post a clear opening or review the candidates already waiting.'],
-        ['Stay on top of active work', 'Review hired workers and attendance from your Work2Wish dashboard.'],
+        ["Your next hire could be here", "Review active jobs and see who has applied."],
+        ["Strong teams start with clear jobs", "Keep job titles, pay, location and requirements accurate."],
+        ["Applicants may be waiting", "Open your job posts and review new candidates."],
+        ["Keep your company profile complete", "A clear company profile helps workers trust the opportunity."],
+        ["Hiring moves faster with replies", "Check Chats and respond to promising candidates."],
+        ["Ready to grow your team?", "Post a new job with clear requirements and start receiving applications."],
+        ["Check today’s candidate activity", "Review applications across your active Work2Wish jobs."],
+        ["Your company details matter", "Keep HR contact, location and company information current."],
+        ["Good job posts attract better matches", "Use clear pay, timing, skills and location details."],
+        ["Don’t keep candidates waiting", "Review pending applications and update the right people quickly."],
+        ["A quick chat can speed up hiring", "Open Chats to answer candidate questions and share next steps."],
+        ["Build a trusted employer profile", "Complete your company details and keep verification information current."],
+        ["New applicants can arrive anytime", "Check your active job cards for fresh interest."],
+        ["Make the opportunity easy to understand", "Clear job descriptions help the right workers apply."],
+        ["Your hiring dashboard is ready", "Review jobs, applicants and hiring progress in one place."],
+        ["Stay responsive", "Fast communication helps serious applicants stay engaged."],
+        ["Profile check-in", "Confirm company logo, HR contact and official details are complete."],
+        ["Need more hands?", "Post a job and specify exactly how many workers you need."],
+        ["Review before you shortlist", "Compare candidate profiles, skills and verification status."],
+        ["Keep hiring organized", "Use Work2Wish to track applicants from application to active work."],
+        ["Your company logo builds recognition", "Make sure your profile logo is current and professional."],
+        ["Check your hiring conversations", "A candidate may have replied since your last visit."],
+        ["Post with confidence", "Accurate pay and work details reduce unnecessary back-and-forth."],
+        ["Keep your workforce moving", "Review hired workers, attendance and ongoing jobs."],
+        ["A complete profile creates trust", "Workers can understand your company better when public details are filled."],
+        ["Hiring opportunity check", "Open your dashboard and review today’s applicant activity."],
+        ["Find the right fit, not just a fast fit", "Review skills, experience and availability before confirming."],
+        ["Keep job information fresh", "Update active job details if timing, location or requirements change."],
+        ["Ready for the next hire?", "Create a clear opening and let Work2Wish bring candidates to you."],
+        ["Candidates value clarity", "Use chat to share reporting time, site contact and next steps."],
+        ["Stay on top of attendance", "Review ongoing worker attendance and job execution."],
+        ["Your HR contact should be reachable", "Confirm the profile shows the correct HR name and mobile number."],
+        ["Don’t miss a promising applicant", "Take a quick look at pending applications now."],
+        ["Build stronger hiring history", "Complete jobs and feedback to strengthen future hiring decisions."],
+        ["One clear post can find the right worker", "Describe the role simply, accurately and completely."],
+        ["Your hiring pipeline needs a quick look", "Review what is pending, selected and ongoing."],
+        ["Keep the candidate experience smooth", "Reply clearly and keep selected workers updated."],
+        ["Company profile reminder", "Review your official email, address, industry and HR contact."],
+        ["Check active work", "See hired workers and attendance before the day moves on."],
+        ["A better post means better matching", "Add useful skills and realistic work details before publishing."],
+        ["Your next team member may have applied", "Open the dashboard and review fresh candidates."],
+        ["Keep Work2Wish working for your team", "Maintain accurate jobs, company details and communication."],
+        ["Hiring follow-up time", "Check Chats for candidate replies and questions."],
+        ["Profile accuracy builds confidence", "Keep company and contact details updated for workers."],
+        ["Review selected workers", "Check who has accepted and what work is currently ongoing."],
+        ["Make your next opening count", "Post complete job details so candidates can decide quickly."],
+        ["A quick review can find a great fit", "See who applied and compare the profiles that match your need."],
+        ["Stay connected with your workforce", "Use Work2Wish chats and updates to keep work moving smoothly."],
+        ["Your hiring workspace is ready", "Jobs, applicants, hires and attendance are all available in Work2Wish."],
+        ["Build your team today", "Check applicants or publish a new opening when you need more people."],
       ];
 
       const { data: subscriptions, error: subError } = await admin
@@ -1052,12 +1146,34 @@ async function route(request, { params }) {
         .in('id', userIds);
       if (profileError) return err(profileError.message, 400);
 
+      // Chrome engagement push is limited to one random message per user per
+      // India calendar day. In-app nudges can continue while the app is open,
+      // but they are stored in the notification panel without triggering Chrome push.
+      const now = new Date();
+      const istNow = new Date(now.getTime() + (330 * 60 * 1000));
+      const istDayStartUtcMs = Date.UTC(
+        istNow.getUTCFullYear(),
+        istNow.getUTCMonth(),
+        istNow.getUTCDate(),
+        0, 0, 0, 0
+      ) - (330 * 60 * 1000);
+      const istDayStartUtc = new Date(istDayStartUtcMs).toISOString();
+
+      const { data: recentRows } = await admin
+        .from('notifications')
+        .select('user_id')
+        .eq('type', 'engagement_push')
+        .gte('created_at', istDayStartUtc)
+        .in('user_id', userIds);
+      const recentlyNotified = new Set((recentRows || []).map((row) => row.user_id));
+
       let notified = 0;
       for (const profile of profiles || []) {
         if (profile.blocked || !['worker', 'employer'].includes(profile.role)) continue;
+        if (recentlyNotified.has(profile.id)) continue;
         const pool = profile.role === 'employer' ? employerMessages : workerMessages;
         const [title, body] = pool[Math.floor(Math.random() * pool.length)];
-        await notify(admin, profile.id, title, body, 'engagement', null);
+        await notify(admin, profile.id, title, body, 'engagement_push', null);
         notified += 1;
       }
       return json({ ok: true, notified });
@@ -1377,6 +1493,7 @@ async function route(request, { params }) {
         return {
           id: user.id,
           email: user.email,
+          phone: user.phone || null,
           role: user.role,
           full_name: user.full_name,
           login_id: user.login_id,
@@ -1403,7 +1520,7 @@ async function route(request, { params }) {
         else if (statusFilter === 'unverified') users = users.filter((u) => !u.verified);
       }
       if (search) {
-        users = users.filter((u) => `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
+        users = users.filter((u) => `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
       }
 
       // Show newly submitted verification requests at the top of the admin table.
@@ -2872,7 +2989,9 @@ async function route(request, { params }) {
       const title = String(body.title || '').trim().slice(0, 120);
       const message = String(body.message || '').trim().slice(0, 500);
       if (!title || !message) return err('title and message required', 400);
-      await notify(admin, me.id, title, message, 'engagement', null);
+      await admin.from('notifications').insert({
+        user_id: me.id, title, body: message, type: 'engagement', related_id: null,
+      });
       return json({ ok: true });
     }
     if (path === 'notifications' && method === 'GET') {

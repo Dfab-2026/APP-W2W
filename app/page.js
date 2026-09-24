@@ -1185,7 +1185,7 @@ export default function App() {
   const [screen, setScreenState] = useState('splash');
   const [navigationHistory, setNavigationHistory] = useState([]); // Track previous screens
   const [auth, setAuth] = useState(null);
-  const [signup, setSignup] = useState({ role: null, full_name: '', email: '', password: '', confirm_password: '' });
+  const [signup, setSignup] = useState({ role: null, full_name: '', email: '', phone: '', password: '', confirm_password: '' });
   const [oauthCtx, setOauthCtx] = useState(null);
   const [forgotEmail, setForgotEmail] = useState('');
   const [language, setLanguage] = useState('en'); // en, hi, etc.
@@ -1231,6 +1231,7 @@ export default function App() {
           profile: s.profile || {},
         };
         setAuth(restored);
+        setNavigationHistory([]);
         setScreenState(dashboardScreenForRole(restored.role));
 
         // Restore and validate in the background. The user stays on the dashboard
@@ -1267,6 +1268,24 @@ export default function App() {
         const supa = getSupabase();
         const { data } = await supa.auth.getSession();
         if (data?.session?.access_token) {
+          // Existing authenticated accounts should resume their role dashboard
+          // immediately when Work2Wish is opened again from any normal app link.
+          try {
+            const me = await api('me', { token: data.session.access_token });
+            if (me?.profile?.id && me?.profile?.role) {
+              const existingPayload = { session: data.session, role: me.profile.role, profile: me.profile };
+              saveSession(existingPayload.session, existingPayload.role, existingPayload.profile);
+              setAuth(existingPayload);
+              setNavigationHistory([]);
+              setScreenState(dashboardScreenForRole(existingPayload.role));
+              setTimeout(() => enableDeviceNotifications(existingPayload.session?.access_token, { requestPermission: false, silent: true }).catch(() => {}), 600);
+              return;
+            }
+          } catch (e) {
+            // New Google users may not have a Work2Wish profile yet; continue
+            // through the existing OAuth role-selection flow below.
+          }
+
           const fin = await api('auth/oauth-finalize', {
             method: 'POST', body: { access_token: data.session.access_token },
           });
@@ -1275,6 +1294,7 @@ export default function App() {
               role: null,
               full_name: fin.full_name || '',
               email: fin.email || '',
+              phone: '',
               password: '',
               confirm_password: '',
               is_google_signup: true,
@@ -1349,7 +1369,7 @@ export default function App() {
     try { await getSupabase().auth.signOut(); } catch {}
     clearSession();
     setAuth(null);
-    setSignup({ role: null, full_name: '', email: '', password: '', confirm_password: '' });
+    setSignup({ role: null, full_name: '', email: '', phone: '', password: '', confirm_password: '' });
     setScreen('login');
   };
 
@@ -1838,7 +1858,7 @@ function AdminApp({ auth, onLogout }) {
       if (statusFilter === 'pending' && !['submitted', 'pending'].includes(u.verification_status || '')) return false;
       if (statusFilter === 'unverified' && u.verified) return false;
       if (!needle) return true;
-      const text = `${u.email || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase();
+      const text = `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase();
       return text.includes(needle);
     });
   }, [users, q, roleFilter, statusFilter]);
@@ -1952,7 +1972,7 @@ function AdminApp({ auth, onLogout }) {
               <div className="grid md:grid-cols-4 gap-2">
                 <div className="relative md:col-span-2">
                   <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                  <Input value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadUsers()} className="pl-9" placeholder="Search email, name, login ID, card, location" />
+                  <Input value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && loadUsers()} className="pl-9" placeholder="Search email, name, login ID, card, mobile" />
                 </div>
                 <Select value={roleFilter} onValueChange={setRoleFilter}>
                   <SelectTrigger><SelectValue placeholder="Role" /></SelectTrigger>
@@ -1967,14 +1987,14 @@ function AdminApp({ auth, onLogout }) {
           </CardHeader>
           <CardContent>
             <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white shadow-sm">
-              <table className="w-full min-w-[1120px] table-fixed text-sm bg-white">
+              <table className="w-full min-w-[1260px] table-fixed text-sm bg-white">
                 <thead className="sticky top-0 z-10 bg-slate-100/95 text-slate-600 border-b border-slate-200">
                   <tr>
                     <th className="w-[250px] text-left p-3 whitespace-nowrap">User</th>
                     <th className="w-[110px] text-left p-3 whitespace-nowrap">Role</th>
                     <th className="w-[130px] text-left p-3 whitespace-nowrap">Login ID</th>
                     <th className="w-[210px] text-left p-3 whitespace-nowrap">Cards</th>
-                    <th className="w-[250px] text-left p-3 whitespace-nowrap">Location</th>
+                    <th className="w-[250px] text-left p-3 whitespace-nowrap">Mobile Number</th>
                     <th className="w-[150px] text-left p-3 whitespace-nowrap">Status</th>
                     <th className="w-[240px] text-right p-3 whitespace-nowrap">Actions</th>
                   </tr>
@@ -1984,7 +2004,7 @@ function AdminApp({ auth, onLogout }) {
                   {localFiltered.map((u) => (
                     <tr key={u.id} className="border-t border-slate-100 align-top transition-colors hover:bg-blue-50/70">
                       <td className="p-3 align-middle overflow-hidden">
-                        <div className="flex items-center gap-3 min-w-0">
+                        <div className="flex items-center gap-3 min-w-0 w-full sm:w-auto">
                           <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'admin' ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
                             {String(u.full_name || u.company_name || u.email || 'U').trim().charAt(0).toUpperCase()}
                           </div>
@@ -2012,7 +2032,11 @@ function AdminApp({ auth, onLogout }) {
                           <p className="text-xs text-muted-foreground">Admin account</p>
                         )}
                       </td>
-                      <td className="p-3 align-middle"><p className="line-clamp-2">{u.location_text || 'No saved location'}</p>{u.latitude && u.longitude && <p className="text-xs text-muted-foreground">{formatCoordinates(u.latitude, u.longitude)}</p>}</td>
+                      <td className="p-3 align-middle whitespace-nowrap">
+                        {u.phone ? (
+                          <a href={`tel:${u.phone}`} className="font-medium text-blue-700 hover:underline" title="Call user">{u.phone}</a>
+                        ) : '—'}
+                      </td>
                       <td className="p-3 align-middle space-y-1 whitespace-nowrap">
                         {u.blocked ? <Badge className="bg-red-100 text-red-700">Blocked</Badge> : <Badge className="bg-emerald-100 text-emerald-700">Active</Badge>}
                         {u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Unverified'}</Badge>}
@@ -2035,7 +2059,7 @@ function AdminApp({ auth, onLogout }) {
                       </td>
                     </tr>
                   ))}
-                  {!usersLoading && localFiltered.length === 0 && <tr><td colSpan="7" className="p-8 text-center text-muted-foreground">No users found.</td></tr>}
+                  {!usersLoading && localFiltered.length === 0 && <tr><td colSpan="8" className="p-8 text-center text-muted-foreground">No users found.</td></tr>}
                 </tbody>
               </table>
             </div>
@@ -2830,7 +2854,9 @@ function SignupForm({ data, onChange, onSent, onBack }) {
   const [busy, setBusy] = useState(false);
   const submit = async (e) => {
     e.preventDefault();
-    if (!data.full_name || !data.email || !data.password || !data.confirm_password) return toast.error('Fill all fields');
+    if (!data.full_name || !data.email || !data.phone || !data.password || !data.confirm_password) return toast.error('Fill all fields');
+    const phoneDigits = String(data.phone || '').replace(/\D/g, '');
+    if (!(phoneDigits.length === 10 || (phoneDigits.length >= 11 && phoneDigits.length <= 15))) return toast.error('Enter a valid mobile number');
     if (data.password.length < 6) return toast.error('Password must be at least 6 characters');
     if (getPasswordStrength(data.password).label === 'Weak') return toast.error('Use a stronger password');
     if (data.password !== data.confirm_password) return toast.error('Passwords do not match');
@@ -2889,6 +2915,18 @@ function SignupForm({ data, onChange, onSent, onBack }) {
                     placeholder="you@example.com"
                   />
                 </div>
+              </div>
+              <div className="relative">
+                <Phone className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  type="tel"
+                  inputMode="tel"
+                  autoComplete="tel"
+                  className="pl-8 h-9 text-sm"
+                  value={data.phone || ''}
+                  onChange={e => onChange({ phone: e.target.value })}
+                  placeholder="Mobile number"
+                />
               </div>
               <div>
                 <Label>Password</Label>
@@ -3293,12 +3331,12 @@ function NotificationCenter({
               exit={{ x: 420, opacity: 0 }}
               transition={{ type: 'spring', damping: 28, stiffness: 260 }}
               onClick={(e) => e.stopPropagation()}
-              className="fixed top-3 right-3 bottom-3 w-[min(430px,94vw)] rounded-[28px] border border-white/80 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.28)] z-[99999] flex flex-col overflow-hidden"
+              className="fixed inset-x-2 top-2 bottom-2 sm:inset-x-auto sm:top-3 sm:right-3 sm:bottom-3 sm:w-[430px] rounded-[22px] sm:rounded-[28px] border border-white/80 bg-white shadow-[0_24px_80px_rgba(15,23,42,0.28)] z-[99999] flex flex-col overflow-hidden"
             >
-              <div className="relative overflow-hidden border-b border-slate-100 bg-gradient-to-br from-white via-slate-50 to-sky-50 p-4 shrink-0">
+              <div className="relative overflow-hidden border-b border-slate-100 bg-gradient-to-br from-white via-slate-50 to-sky-50 p-3 sm:p-4 shrink-0">
                 <div className="absolute -top-16 -right-16 w-40 h-40 rounded-full bg-sky-200/40 blur-2xl" />
-                <div className="relative flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
+                <div className="relative flex flex-col gap-3">
+                  <div className="flex w-full items-center gap-3 min-w-0">
                     <Button
                       type="button"
                       size="icon"
@@ -3320,7 +3358,7 @@ function NotificationCenter({
                   </div>
 
                   {!selected && (
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto sm:shrink-0">
                       {pushPermission !== 'granted' && (
                         <Button
                           type="button"
@@ -3328,7 +3366,7 @@ function NotificationCenter({
                           size="sm"
                           disabled={pushBusy}
                           onClick={enableChromeAlerts}
-                          className="h-9 rounded-xl text-xs bg-white border-sky-200 text-sky-700 hover:bg-sky-50"
+                          className="h-9 min-w-0 flex-1 rounded-xl bg-white px-3 text-xs text-sky-700 border-sky-200 hover:bg-sky-50 sm:flex-none whitespace-nowrap"
                         >
                           {pushBusy ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : <Bell className="w-3.5 h-3.5 mr-1.5" />}
                           {pushPermission === 'denied' ? 'Alerts blocked' : 'Enable Chrome Alerts'}
@@ -3344,7 +3382,7 @@ function NotificationCenter({
                             await api('notifications/read-all', { method: 'POST', token }).catch(() => null);
                             toast.success('All marked as read');
                           }}
-                          className="h-9 rounded-xl text-xs text-slate-700 hover:bg-white"
+                          className="h-9 rounded-xl px-3 text-xs text-slate-700 hover:bg-white whitespace-nowrap"
                         >
                           Mark read
                         </Button>
@@ -3356,7 +3394,7 @@ function NotificationCenter({
               </div>
 
               {selected ? (
-                <div className="flex-1 overflow-y-auto bg-slate-50 p-4 space-y-4">
+                <div className="flex-1 overflow-x-hidden overflow-y-auto bg-slate-50 p-3 sm:p-4 space-y-4">
                   <div className="rounded-3xl bg-white border border-slate-200 shadow-sm p-5">
                     <div className={`w-14 h-14 rounded-2xl bg-gradient-to-br ${accentClasses.icon} text-white flex items-center justify-center shadow-lg mb-4`}>
                       <Bell className="w-7 h-7" />
@@ -3364,7 +3402,7 @@ function NotificationCenter({
                     <h3 className="text-xl font-extrabold text-slate-950 leading-tight">
                       {selected?.title || 'Notification'}
                     </h3>
-                    <p className="mt-3 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                    <p className="mt-3 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
                       {selected?.message || 'No details'}
                     </p>
                   </div>
@@ -3393,7 +3431,7 @@ function NotificationCenter({
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                     <Button
                       type="button"
                       variant="outline"
@@ -3423,7 +3461,7 @@ function NotificationCenter({
                   </div>
                 </div>
               ) : (
-                <div className="flex-1 overflow-y-auto bg-slate-50/80 p-3 space-y-3">
+                <div className="flex-1 overflow-x-hidden overflow-y-auto bg-slate-50/80 p-2.5 sm:p-3 space-y-3">
                   {loading ? (
                     <div className="h-full min-h-64 flex items-center justify-center text-slate-500">
                       <Loader2 className="w-6 h-6 animate-spin" />
@@ -3454,7 +3492,7 @@ function NotificationCenter({
                           <div className="flex-1 min-w-0">
                             <div className="flex items-start justify-between gap-3">
                               <div className="min-w-0">
-                                <p className="font-extrabold text-sm text-slate-950 truncate">
+                                <p className="font-extrabold text-sm text-slate-950 break-words leading-snug">
                                   {item.title || 'Notification'}
                                 </p>
                                 <div className="flex items-center gap-2 mt-1 flex-wrap">
