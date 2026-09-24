@@ -2015,18 +2015,7 @@ function AdminApp({ auth, onLogout }) {
                           </div>
                         </div>
                       </td>
-                      <td className="p-3 align-middle capitalize whitespace-nowrap"><span
-  className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${
-    u.role === 'employer'
-      ? 'bg-emerald-100 text-emerald-700'
-      : u.role === 'admin'
-      ? 'bg-amber-100 text-amber-800'
-      : 'bg-blue-100 text-blue-700'
-  }`}
->
-  {u.role}
-</span>
-</td>
+                      <td className="p-3 align-middle capitalize whitespace-nowrap"><Badge className={u.role === 'employer' ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-100' : u.role === 'admin' ? 'bg-violet-100 text-violet-700 hover:bg-violet-100' : 'bg-blue-100 text-blue-700 hover:bg-blue-100'}>{u.role}</Badge></td>
                       <td className="p-3 align-middle whitespace-nowrap">{u.login_id || '—'}</td>
                       <td className="p-3 align-middle">
                         {u.role === 'worker' ? (

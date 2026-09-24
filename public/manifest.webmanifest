@@ -1,0 +1,25 @@
+{
+  "name": "Work2Wish",
+  "short_name": "Work2Wish",
+  "description": "Work2Wish connects skilled workers with employers for daily and short-term jobs.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/work2wish-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/work2wish-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
