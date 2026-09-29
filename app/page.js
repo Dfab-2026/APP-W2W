@@ -438,6 +438,7 @@ function handleAuthFailureOnce() {
 
 function dashboardScreenForRole(role) {
   if (role === 'admin') return 'admin-app';
+  if (role === 'consultant') return 'consultant-app';
   if (role === 'employer') return 'employer-app';
   return 'worker-app';
 }
@@ -1181,7 +1182,7 @@ function MaintenanceScreen({ settings, isAdmin = false, onRefresh }) {
 // ============================================================
 export default function App() {
   // screens: 'splash' | 'login' | 'signup-role' | 'signup-form' | 'signup-otp'
-  //        | 'oauth-role' | 'forgot-email' | 'forgot-reset' | 'worker-app' | 'employer-app'
+  //        | 'oauth-role' | 'forgot-email' | 'forgot-reset' | 'worker-app' | 'employer-app' | 'consultant-app'
   const [screen, setScreenState] = useState('splash');
   const [navigationHistory, setNavigationHistory] = useState([]); // Track previous screens
   const [auth, setAuth] = useState(null);
@@ -1219,6 +1220,19 @@ export default function App() {
   };
 
   useEffect(() => { loadAppSettings(); }, []);
+
+  // Preserve a consultant referral code while the visitor completes login/signup.
+  // Attribution happens only after a Worker/Employer account is authenticated.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const referralCode = String(params.get('ref') || '').trim().toUpperCase();
+      if (/^[A-Z0-9-]{4,32}$/.test(referralCode)) {
+        window.localStorage.setItem('w2w_consultant_referral', referralCode);
+      }
+    } catch {}
+  }, []);
 
   // ----- Boot sequence -----
   useEffect(() => {
@@ -1365,6 +1379,34 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!auth?.session?.access_token || !['worker', 'employer'].includes(auth?.role)) return;
+    const referralCode = window.localStorage.getItem('w2w_consultant_referral');
+    if (!referralCode) return;
+    let cancelled = false;
+    api('consultant/referrals/claim', {
+      method: 'POST',
+      token: auth.session.access_token,
+      body: { referral_code: referralCode },
+    }).then(() => {
+      if (cancelled) return;
+      window.localStorage.removeItem('w2w_consultant_referral');
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('ref');
+        window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+      } catch {}
+    }).catch((error) => {
+      // Remove a permanently invalid code, but keep it for a later retry when the
+      // failure is only network/setup related.
+      if (/invalid consultant referral link/i.test(String(error?.message || ''))) {
+        window.localStorage.removeItem('w2w_consultant_referral');
+      }
+    });
+    return () => { cancelled = true; };
+  }, [auth?.session?.access_token, auth?.role]);
+
   const handleLogout = async () => {
     try { await getSupabase().auth.signOut(); } catch {}
     clearSession();
@@ -1406,7 +1448,7 @@ export default function App() {
     } catch (e) { toast.error(e.message); }
   };
 
-  if (maintenanceChecked && appSettings?.maintenance_mode && auth?.role !== 'admin' && ['worker-app', 'employer-app'].includes(screen)) {
+  if (maintenanceChecked && appSettings?.maintenance_mode && auth?.role !== 'admin' && ['worker-app', 'employer-app', 'consultant-app'].includes(screen)) {
     return <MaintenanceScreen settings={appSettings} onRefresh={loadAppSettings} />;
   }
 
@@ -1466,7 +1508,161 @@ export default function App() {
           <EmployerApp auth={auth} onLogout={handleLogout} />
         </motion.div>
       )}
+      {screen === 'consultant-app' && (
+        <motion.div key="consultant-app" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+          <ConsultantApp auth={auth} onLogout={handleLogout} />
+        </motion.div>
+      )}
     </AnimatePresence>
+  );
+}
+
+
+function ConsultantApp({ auth, onLogout }) {
+  const token = auth?.session?.access_token;
+  const userId = auth?.profile?.id || auth?.session?.user?.id;
+  const [dashboard, setDashboard] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const loadDashboard = useCallback(async ({ silent = false } = {}) => {
+    if (!token) return;
+    if (!silent) setLoading(true);
+    try {
+      const data = await api('consultant/dashboard', { token });
+      setDashboard(data);
+    } catch (e) {
+      toast.error(e.message || 'Unable to load consultant dashboard');
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [token]);
+
+  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!token || typeof window === 'undefined') return undefined;
+    const refreshIfVisible = () => {
+      if (!document.hidden) loadDashboard({ silent: true });
+    };
+    const timer = window.setInterval(refreshIfVisible, 30_000);
+    window.addEventListener('focus', refreshIfVisible);
+    document.addEventListener('visibilitychange', refreshIfVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshIfVisible);
+      document.removeEventListener('visibilitychange', refreshIfVisible);
+    };
+  }, [token, loadDashboard]);
+
+  const referralLink = useMemo(() => {
+    if (!dashboard?.referral_code || typeof window === 'undefined') return '';
+    return `${window.location.origin}/?ref=${encodeURIComponent(dashboard.referral_code)}`;
+  }, [dashboard?.referral_code]);
+
+  const copyReferralLink = async () => {
+    if (!referralLink) return;
+    try {
+      await navigator.clipboard.writeText(referralLink);
+      toast.success('Consultant link copied');
+    } catch {
+      toast.error('Unable to copy link');
+    }
+  };
+
+  const shareReferralLink = async () => {
+    if (!referralLink) return;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'Join Work2Wish', text: 'Use my Work2Wish consultant link to login or create your account.', url: referralLink });
+        return;
+      } catch (e) {
+        if (e?.name === 'AbortError') return;
+      }
+    }
+    await copyReferralLink();
+  };
+
+  return (
+    <div className="h-[100dvh] overflow-y-auto overflow-x-hidden bg-gradient-to-br from-slate-50 via-violet-50/50 to-amber-50/40 text-slate-950">
+      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur shadow-sm">
+        <div className="container py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <Work2WishLogo className="w-11 h-11" />
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.16em] text-violet-600">Work2Wish Consultant</p>
+              <h1 className="text-2xl font-extrabold">Consultant Dashboard</h1>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <NotificationCenter token={token} userId={userId} channelKey="consultant" accent="amber" />
+            <Button variant="outline" onClick={() => loadDashboard()} disabled={loading}>{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
+            <Button onClick={onLogout} className="bg-slate-900 hover:bg-slate-800 text-white"><LogOut className="w-4 h-4 mr-2" />Logout</Button>
+          </div>
+        </div>
+      </header>
+
+      <main className="container py-6 pb-24 space-y-5">
+        <div className="grid sm:grid-cols-3 gap-4">
+          <Card className="border-violet-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">People from your link</p><p className="mt-2 text-3xl font-black text-violet-700">{dashboard?.total_referrals || 0}</p><p className="mt-1 text-xs text-slate-500">{dashboard?.total_login_events || 0} tracked link login{Number(dashboard?.total_login_events || 0) === 1 ? '' : 's'}</p></CardContent></Card>
+          <Card className="border-emerald-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Admin verified referrals</p><p className="mt-2 text-3xl font-black text-emerald-700">{dashboard?.verified_referrals || 0}</p></CardContent></Card>
+          <Card className="border-amber-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Points</p><p className="mt-2 text-3xl font-black text-amber-700">{dashboard?.points || 0}</p><p className="mt-1 text-xs text-slate-500">1 point for each referred person verified by Admin.</p></CardContent></Card>
+        </div>
+
+        <Card className="border-violet-200 bg-white shadow-sm">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Copy className="w-5 h-5 text-violet-700" />Your unique consultant link</CardTitle>
+            <CardDescription>Share this link. A Worker or Employer who logs in through it is attached to your consultant account.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <Input value={referralLink} readOnly className="font-mono text-sm bg-slate-50" />
+              <Button type="button" onClick={copyReferralLink} className="bg-violet-600 hover:bg-violet-700"><Copy className="w-4 h-4 mr-2" />Copy Link</Button>
+              <Button type="button" variant="outline" onClick={shareReferralLink}><Send className="w-4 h-4 mr-2" />Share</Button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
+              <Badge className="bg-violet-100 text-violet-800 border border-violet-200">Code: {dashboard?.referral_code || '—'}</Badge>
+              <span>Referral credit is counted once per Work2Wish account.</span>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-slate-200 bg-white shadow-sm">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2"><Users className="w-5 h-5 text-violet-700" />People from your link</CardTitle>
+            <CardDescription>Verified people receive a badge here and add one point to your total.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {loading && !dashboard ? (
+              <div className="py-12 text-center text-slate-500"><Loader2 className="w-5 h-5 animate-spin inline mr-2" />Loading referrals…</div>
+            ) : (dashboard?.referrals || []).length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-10 text-center">
+                <Users className="w-9 h-9 mx-auto text-slate-400" />
+                <p className="mt-3 font-semibold">No referred logins yet</p>
+                <p className="mt-1 text-sm text-slate-500">Share your consultant link to start tracking people.</p>
+              </div>
+            ) : (
+              <div className="overflow-x-auto rounded-2xl border border-slate-200">
+                <table className="w-full min-w-[760px] text-sm">
+                  <thead className="bg-slate-50 text-slate-600"><tr><th className="p-3 text-left">Person</th><th className="p-3 text-left">Role</th><th className="p-3 text-left">Joined through link</th><th className="p-3 text-left">Link logins</th><th className="p-3 text-left">Status</th><th className="p-3 text-right">Points</th></tr></thead>
+                  <tbody>
+                    {(dashboard?.referrals || []).map((item) => (
+                      <tr key={item.id} className="border-t border-slate-100">
+                        <td className="p-3"><p className="font-semibold text-slate-900">{item.full_name || 'Work2Wish user'}</p><p className="text-xs text-slate-500">{item.email || '—'}</p></td>
+                        <td className="p-3 capitalize">{item.role || '—'}</td>
+                        <td className="p-3">{item.registered_at ? new Date(item.registered_at).toLocaleString() : '—'}</td>
+                        <td className="p-3 font-semibold text-slate-700">{item.login_count || 1}</td>
+                        <td className="p-3">{item.points_awarded || item.status === 'verified' ? <Badge className="bg-emerald-100 text-emerald-800 border border-emerald-200"><CheckCircle2 className="w-3.5 h-3.5 mr-1" />Admin Verified</Badge> : <Badge variant="outline" className="text-amber-700 border-amber-200 bg-amber-50">Awaiting verification</Badge>}</td>
+                        <td className="p-3 text-right font-bold text-amber-700">{item.points_awarded ? '+1' : '0'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </main>
+    </div>
   );
 }
 
@@ -1582,11 +1778,12 @@ function AdminApp({ auth, onLogout }) {
     stats.total += 1;
     if (user.role === 'worker') stats.workers += 1;
     if (user.role === 'employer') stats.employers += 1;
+    if (user.role === 'consultant') stats.consultants += 1;
     if (user.verification_status === 'submitted' || user.verification_status === 'pending') stats.pending += 1;
     if (user.verified) stats.verified += 1;
     if (user.blocked) stats.blocked += 1;
     return stats;
-  }, { total: 0, workers: 0, employers: 0, pending: 0, verified: 0, blocked: 0 }), [users]);
+  }, { total: 0, workers: 0, employers: 0, consultants: 0, pending: 0, verified: 0, blocked: 0 }), [users]);
 
   const loadUsers = async ({ silent = false } = {}) => {
     if (!token) return;
@@ -1716,6 +1913,10 @@ function AdminApp({ auth, onLogout }) {
       await verifySection(action.section);
       return;
     }
+    if (action.type === 'unapprove-section') {
+      await unverifySection(action.section);
+      return;
+    }
     if (action.type === 'final') await verifyUser(action.userId, true);
   };
 
@@ -1768,9 +1969,9 @@ function AdminApp({ auth, onLogout }) {
   };
   const isSectionVerified = (section) => getAdminSectionState(section) === 'verified';
   const adminUserRole = (selected?.role || '').toLowerCase();
-  const selectedDetailsLocked = !!selected && adminUserRole !== 'admin' && selected?.submitted_for_review === false;
-  const adminRequiredSections = adminUserRole === 'worker' ? ['profile', 'bank', 'verification'] : ['profile', 'verification'];
-  const adminRequiredSectionsDone = adminRequiredSections.every(isSectionVerified);
+  const selectedDetailsLocked = !!selected && !['admin', 'consultant'].includes(adminUserRole) && selected?.submitted_for_review === false;
+  const adminRequiredSections = adminUserRole === 'worker' ? ['profile', 'bank', 'verification'] : adminUserRole === 'employer' ? ['profile', 'verification'] : [];
+  const adminRequiredSectionsDone = adminRequiredSections.length === 0 || adminRequiredSections.every(isSectionVerified);
 
   const verifySection = async (section) => {
     if (!selected?.id || busy) return;
@@ -1824,6 +2025,33 @@ function AdminApp({ auth, onLogout }) {
     }
   };
 
+  const unverifySection = async (section) => {
+    if (!selected?.id || busy) return;
+    const normalizedSection = normalizeVerificationSection(section);
+    const selectedId = selected.id;
+    setBusy(true);
+    try {
+      await api(`admin/users/${selectedId}/section-verify`, { method: 'PATCH', token, body: { section: normalizedSection, approved: false } });
+      setUsers((current) => current.map((user) => user.id === selectedId ? {
+        ...user,
+        verified: false,
+        verification_status: 'pending',
+      } : user));
+      const detail = await api(`admin/users/${selectedId}`, { token });
+      if (detail?.user) setSelected(detail.user);
+      toast.success('Approval removed. Section returned to review.');
+    } catch (e) {
+      toast.error(e.message || 'Unable to remove approval');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const requestSectionUnapproval = (section, label) => {
+    if (!selected?.id || busy) return;
+    setApprovalConfirm({ type: 'unapprove-section', section, label, userId: selected.id });
+  };
+
   const sendAdminProfileMessage = async () => {
     if (!selected?.id || !adminMessage.trim()) return toast.error('Enter message');
     setBusy(true);
@@ -1858,7 +2086,7 @@ function AdminApp({ auth, onLogout }) {
       if (statusFilter === 'pending' && !['submitted', 'pending'].includes(u.verification_status || '')) return false;
       if (statusFilter === 'unverified' && u.verified) return false;
       if (!needle) return true;
-      const text = `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase();
+      const text = `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.referral_code || ''} ${u.verification_status || ''}`.toLowerCase();
       return text.includes(needle);
     });
   }, [users, q, roleFilter, statusFilter]);
@@ -1886,11 +2114,12 @@ function AdminApp({ auth, onLogout }) {
       </header>
 
       <main className="container min-h-[calc(100dvh-96px)] overflow-visible py-6 space-y-6 pb-24">
-        <div className="grid xl:grid-cols-6 md:grid-cols-3 sm:grid-cols-2 gap-4">
+        <div className="grid xl:grid-cols-7 md:grid-cols-3 sm:grid-cols-2 gap-4">
           {[
             ['Total users', adminStats.total, 'text-slate-900'],
             ['Workers', adminStats.workers, 'text-blue-700'],
             ['Employers', adminStats.employers, 'text-emerald-700'],
+            ['Consultants', adminStats.consultants, 'text-violet-700'],
             ['Pending verify', adminStats.pending, 'text-amber-600'],
             ['Verified', adminStats.verified, 'text-emerald-600'],
             ['Blocked', adminStats.blocked, 'text-red-600'],
@@ -1918,7 +2147,7 @@ function AdminApp({ auth, onLogout }) {
           <Card className="border-amber-200 bg-gradient-to-br from-amber-50 to-orange-50 shadow-sm">
             <CardHeader>
               <CardTitle className="flex items-center gap-2"><ShieldAlert className="w-5 h-5 text-amber-700" /> App Update / Maintenance Mode</CardTitle>
-              <CardDescription>Turn this ON before deployment or database changes. Workers and employers will see an update screen. Admin remains allowed.</CardDescription>
+              <CardDescription>Turn this ON before deployment or database changes. Workers, employers and consultants will see an update screen. Admin remains allowed.</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -1976,7 +2205,7 @@ function AdminApp({ auth, onLogout }) {
                 </div>
                 <Select value={roleFilter} onValueChange={setRoleFilter}>
                   <SelectTrigger><SelectValue placeholder="Role" /></SelectTrigger>
-                  <SelectContent><SelectItem value="all">All roles</SelectItem><SelectItem value="worker">Workers</SelectItem><SelectItem value="employer">Employers</SelectItem><SelectItem value="admin">Admins</SelectItem></SelectContent>
+                  <SelectContent><SelectItem value="all">All roles</SelectItem><SelectItem value="worker">Workers</SelectItem><SelectItem value="employer">Employers</SelectItem><SelectItem value="consultant">Consultants</SelectItem><SelectItem value="admin">Admins</SelectItem></SelectContent>
                 </Select>
                 <Select value={statusFilter} onValueChange={setStatusFilter}>
                   <SelectTrigger><SelectValue placeholder="Status" /></SelectTrigger>
@@ -2005,7 +2234,7 @@ function AdminApp({ auth, onLogout }) {
                     <tr key={u.id} className="border-t border-slate-100 align-top transition-colors hover:bg-blue-50/70">
                       <td className="p-3 align-middle overflow-hidden">
                         <div className="flex items-center gap-3 min-w-0 w-full sm:w-auto">
-                          <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'admin' ? 'bg-violet-100 text-violet-700' : 'bg-blue-100 text-blue-700'}`}>
+                          <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-violet-100 text-violet-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>
                             {String(u.full_name || u.company_name || u.email || 'U').trim().charAt(0).toUpperCase()}
                           </div>
                           <div className="min-w-0">
@@ -2016,17 +2245,8 @@ function AdminApp({ auth, onLogout }) {
                         </div>
                       </td>
                       <td className="p-3 align-middle capitalize whitespace-nowrap">
-<span
-  className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-semibold ${
-    u.role === 'employer'
-      ? 'bg-emerald-100 text-emerald-700'
-      : u.role === 'admin'
-      ? 'bg-amber-100 text-amber-800'
-      : 'bg-blue-100 text-blue-700'
-  }`}
->
-  {u.role}
-</span>                      </td>
+                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-violet-100 text-violet-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>{u.role}</span>
+                      </td>
                       <td className="p-3 align-middle whitespace-nowrap">{u.login_id || '—'}</td>
                       <td className="p-3 align-middle">
                         {u.role === 'worker' ? (
@@ -2039,6 +2259,11 @@ function AdminApp({ auth, onLogout }) {
                             <p className="text-xs">Company PAN: {u.pan_number || '—'}</p>
                             <p className="text-xs">GST: {u.gst_number || '—'}</p>
                           </>
+                        ) : u.role === 'consultant' ? (
+                          <>
+                            <p className="text-xs">Referral: {u.referral_code || '—'}</p>
+                            <p className="text-xs">Points: {u.points || 0} · Referrals: {u.total_referrals || 0}</p>
+                          </>
                         ) : (
                           <p className="text-xs text-muted-foreground">Admin account</p>
                         )}
@@ -2050,7 +2275,7 @@ function AdminApp({ auth, onLogout }) {
                       </td>
                       <td className="p-3 align-middle space-y-1 whitespace-nowrap">
                         {u.blocked ? <Badge className="bg-red-100 text-red-700">Blocked</Badge> : <Badge className="bg-emerald-100 text-emerald-700">Active</Badge>}
-                        {u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Unverified'}</Badge>}
+                        {u.role === 'consultant' ? <Badge className="bg-violet-100 text-violet-700 border border-violet-200 block w-fit">Referral active</Badge> : u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Unverified'}</Badge>}
                         {(() => {
                           try {
                             const submittedAt = u.verification_submitted_at ? new Date(u.verification_submitted_at) : null;
@@ -2110,13 +2335,15 @@ function AdminApp({ auth, onLogout }) {
                 <InfoTile label="Role" value={selected.role} />
                 <InfoTile label="Login ID" value={selected.login_id} />
                 <InfoTile label="Phone" value={selected.phone} />
-                <InfoTile label="Location" value={selected.location_text} />
-                <InfoTile label="Account status" value={selected.verified ? 'Verified account' : (selected.verification_status || 'Not submitted')} />
+                <InfoTile label={adminUserRole === 'consultant' ? 'Referral code' : 'Location'} value={adminUserRole === 'consultant' ? selected.referral_code : selected.location_text} />
+                <InfoTile label="Account status" value={adminUserRole === 'consultant' ? 'Consultant active' : selected.verified ? 'Verified account' : (selected.verification_status || 'Not submitted')} />
                 <InfoTile label="Created" value={selected.created_at ? new Date(selected.created_at).toLocaleString() : '—'} />
                 <InfoTile label="Last updated" value={selected.updated_at ? new Date(selected.updated_at).toLocaleString() : '—'} />
               </div>
 
-              {(() => {
+              {adminUserRole === 'consultant' ? (
+                <ConsultantAdminSummary selected={selected} />
+              ) : (() => {
                 const canFinalVerify = adminRequiredSectionsDone;
                 const verificationTitle = selected.role === 'worker' ? 'Worker Verification' : 'Employer Verification';
                 return (
@@ -2128,6 +2355,7 @@ function AdminApp({ auth, onLogout }) {
                       status={getAdminSectionState('profile')}
                       verified={isSectionVerified('profile')}
                       onVerify={() => requestSectionApproval('profile', 'Profile')}
+                      onUnapprove={() => requestSectionUnapproval('profile', 'Profile')}
                       disabled={busy || selected.role === 'admin'}
                     >
                       {selected.role === 'worker' ? (
@@ -2143,7 +2371,7 @@ function AdminApp({ auth, onLogout }) {
                             <InfoTile label="Saved work location" value={selected.location_text || selected.place_name} />
                             <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
                             <InfoTile label="Skills" value={Array.isArray(selected.skills) ? selected.skills.join(', ') : selected.skills} />
-                            <InfoTile label="Experience years" value={selected.experience_years !== undefined && selected.experience_years !== null ? `${selected.experience_years} years` : '—'} />
+                            <InfoTile label="Experience" value={formatWorkerExperience(selected)} />
                             <InfoTile label="Experience level" value={selected.experience_level} />
                             <InfoTile label="Expected daily wage" value={selected.expected_daily_wage ? `₹${selected.expected_daily_wage}` : '—'} />
                             <InfoTile label="Languages known" value={Array.isArray(selected.languages_known) ? selected.languages_known.join(', ') : selected.languages_known} />
@@ -2177,6 +2405,7 @@ function AdminApp({ auth, onLogout }) {
                         status={getAdminSectionState('bank')}
                         verified={isSectionVerified('bank')}
                         onVerify={() => requestSectionApproval('bank', 'Bank Details')}
+                        onUnapprove={() => requestSectionUnapproval('bank', 'Bank Details')}
                         disabled={busy || selected.role === 'admin'}
                       >
                         <InfoTile label="Account holder" value={selected.account_holder_name || selected.full_name || selected.company_name} />
@@ -2197,6 +2426,7 @@ function AdminApp({ auth, onLogout }) {
                       status={getAdminSectionState('verification')}
                       verified={isSectionVerified('verification')}
                       onVerify={() => requestSectionApproval('verification', verificationTitle)}
+                      onUnapprove={() => requestSectionUnapproval('verification', verificationTitle)}
                       disabled={busy || selected.role === 'admin'}
                     >
                       {selected.role === 'worker' && <InfoTile label="Aadhaar" value={selected.aadhaar_number} />}
@@ -2251,17 +2481,19 @@ function AdminApp({ auth, onLogout }) {
               </motion.div>
 
               <div className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                <Button
-                  type="button"
-                  disabled={busy || adminUserRole === 'admin' || !!selected.verified || !adminRequiredSectionsDone}
-                  onClick={requestFinalApproval}
-                  className="whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 disabled:!bg-emerald-600 disabled:!text-white disabled:!opacity-100 disabled:cursor-default"
-                  style={selected.verified ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
-                >
-                  {selected.verified ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <ShieldCheck className="w-4 h-4 mr-2" />}
-                  <span className="whitespace-nowrap">{selected.verified ? 'Account verified' : 'Final verify account'}</span>
-                </Button>
-                <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>
+                {adminUserRole !== 'consultant' && (
+                  <Button
+                    type="button"
+                    disabled={busy || adminUserRole === 'admin' || !!selected.verified || !adminRequiredSectionsDone}
+                    onClick={requestFinalApproval}
+                    className="whitespace-nowrap bg-emerald-600 hover:bg-emerald-700 disabled:!bg-emerald-600 disabled:!text-white disabled:!opacity-100 disabled:cursor-default"
+                    style={selected.verified ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
+                  >
+                    {selected.verified ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <ShieldCheck className="w-4 h-4 mr-2" />}
+                    <span className="whitespace-nowrap">{selected.verified ? 'Account verified' : 'Final verify account'}</span>
+                  </Button>
+                )}
+                {adminUserRole !== 'consultant' && <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>}
                 <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => blockUser(selected.id, !selected.blocked)}>{selected.blocked ? 'Unblock user' : 'Block user'}</Button>
                 <Button type="button" disabled={busy || selected.role === 'admin'} variant="destructive" className="whitespace-nowrap" onClick={() => deleteUser(selected.id, selected.email)}>Delete user</Button>
               </div>
@@ -2326,20 +2558,30 @@ function AdminApp({ auth, onLogout }) {
       <Dialog open={!!approvalConfirm} onOpenChange={(open) => !open && !busy && setApprovalConfirm(null)}>
         <DialogContent className="sm:max-w-md rounded-2xl">
           <DialogHeader>
-            <DialogTitle>Confirm approval</DialogTitle>
+            <DialogTitle>{approvalConfirm?.type === 'unapprove-section' ? 'Remove approval' : 'Confirm approval'}</DialogTitle>
             <DialogDescription>
-              {approvalConfirm?.type === 'final'
-                ? `Approve the complete account for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`
-                : `Approve ${approvalConfirm?.label || 'this section'} for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`}
+              {approvalConfirm?.type === 'unapprove-section'
+                ? `Remove approval for ${approvalConfirm?.label || 'this section'} for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`
+                : approvalConfirm?.type === 'final'
+                  ? `Approve the complete account for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`
+                  : `Approve ${approvalConfirm?.label || 'this section'} for ${selected?.full_name || selected?.company_name || selected?.email || 'this user'}?`}
             </DialogDescription>
           </DialogHeader>
-          <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-            Review the submitted details before approving. Choose Cancel to return without changing the verification status.
+          <div className={`rounded-xl border p-3 text-sm ${approvalConfirm?.type === 'unapprove-section' ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+            {approvalConfirm?.type === 'unapprove-section'
+              ? 'This returns only this section to Awaiting review and removes final account verification until it is approved again.'
+              : 'Review the submitted details before approving. Choose Cancel to return without changing the verification status.'}
           </div>
           <DialogFooter className="gap-2 sm:gap-2">
             <Button type="button" variant="outline" disabled={busy} onClick={() => setApprovalConfirm(null)}>Cancel</Button>
-            <Button type="button" disabled={busy} onClick={confirmAdminApproval} className="bg-emerald-600 text-white hover:bg-emerald-700">
-              {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <CheckCircle2 className="w-4 h-4 mr-2" />} Approve
+            <Button
+              type="button"
+              disabled={busy}
+              onClick={confirmAdminApproval}
+              className={approvalConfirm?.type === 'unapprove-section' ? 'bg-rose-600 text-white hover:bg-rose-700' : 'bg-emerald-600 text-white hover:bg-emerald-700'}
+            >
+              {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : approvalConfirm?.type === 'unapprove-section' ? <X className="w-4 h-4 mr-2" /> : <CheckCircle2 className="w-4 h-4 mr-2" />}
+              {approvalConfirm?.type === 'unapprove-section' ? 'Unapprove' : 'Approve'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -2348,7 +2590,7 @@ function AdminApp({ auth, onLogout }) {
   );
 }
 
-function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_submitted', verified, children, onVerify, disabled }) {
+function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_submitted', verified, children, onVerify, onUnapprove, disabled }) {
   const normalizedStatus = verified ? 'verified' : normalizeVerifyStatusValue(status) || 'not_submitted';
   const palette = {
     indigo: { shell: 'border-indigo-200/80 bg-gradient-to-br from-white via-indigo-50/50 to-blue-50/70', icon: 'bg-indigo-600', ring: 'shadow-indigo-100' },
@@ -2374,16 +2616,31 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
             <Badge className={`mt-2 border px-2.5 py-1 font-bold whitespace-nowrap ${meta.badge}`}>{meta.label}</Badge>
           </div>
         </div>
-        <Button
-          type="button"
-          size="sm"
-          disabled={disabled || normalizedStatus === 'verified' || normalizedStatus === 'not_submitted'}
-          onClick={(event) => { event.preventDefault(); event.stopPropagation(); onVerify?.(); }}
-          className={`${meta.button} h-10 min-w-[168px] shrink-0 whitespace-nowrap rounded-xl px-4 text-white shadow-md disabled:!opacity-100 disabled:cursor-default`}
-          style={normalizedStatus === 'verified' ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
-        >
-          <ActionIcon className="w-4 h-4 mr-1.5 shrink-0" /> <span className="whitespace-nowrap">{meta.buttonLabel}</span>
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            disabled={disabled || normalizedStatus === 'verified' || normalizedStatus === 'not_submitted'}
+            onClick={(event) => { event.preventDefault(); event.stopPropagation(); onVerify?.(); }}
+            className={`${meta.button} h-10 min-w-[168px] shrink-0 whitespace-nowrap rounded-xl px-4 text-white shadow-md disabled:!opacity-100 disabled:cursor-default`}
+            style={normalizedStatus === 'verified' ? { backgroundColor: '#16a34a', borderColor: '#16a34a', color: '#ffffff', opacity: 1 } : undefined}
+          >
+            <ActionIcon className="w-4 h-4 mr-1.5 shrink-0" /> <span className="whitespace-nowrap">{meta.buttonLabel}</span>
+          </Button>
+          {normalizedStatus === 'verified' && !disabled && (
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              onClick={(event) => { event.preventDefault(); event.stopPropagation(); onUnapprove?.(); }}
+              className="h-10 w-10 shrink-0 rounded-xl border-rose-200 bg-white text-rose-600 hover:bg-rose-50 hover:text-rose-700"
+              title="Unapprove this section"
+              aria-label={`Unapprove ${title}`}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          )}
+        </div>
       </div>
       <div className="relative space-y-3">{children}</div>
     </motion.section>
@@ -2412,6 +2669,74 @@ function AdminCompactList({ title, icon, rows = [], empty = 'No records.' }) {
           </motion.div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function ConsultantAdminSummary({ selected }) {
+  const dashboard = selected?.consultant_dashboard || {};
+  const referralCode = dashboard.referral_code || selected?.referral_code || '';
+  const referralLink = referralCode
+    ? `${typeof window !== 'undefined' ? window.location.origin : getCanonicalAppUrl()}/?ref=${encodeURIComponent(referralCode)}`
+    : '—';
+  const referrals = Array.isArray(dashboard.referrals) ? dashboard.referrals : [];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid lg:grid-cols-2 gap-4">
+        <Card className="border-violet-200 bg-white shadow-sm">
+          <CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><UserCircle className="w-4 h-4 text-violet-700" />Consultant details</CardTitle></CardHeader>
+          <CardContent className="grid sm:grid-cols-2 gap-3">
+            <InfoTile label="Full name" value={selected?.full_name} />
+            <InfoTile label="Email" value={selected?.email} />
+            <InfoTile label="Mobile number" value={selected?.phone} />
+            <InfoTile label="Login ID" value={selected?.login_id} />
+            <InfoTile label="Referral code" value={referralCode} />
+            <InfoTile label="Created" value={selected?.created_at ? new Date(selected.created_at).toLocaleString() : '—'} />
+            <div className="sm:col-span-2"><InfoTile label="Unique referral link" value={referralLink} /></div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-amber-200 bg-white shadow-sm">
+          <CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><Award className="w-4 h-4 text-amber-700" />Consultant dashboard summary</CardTitle></CardHeader>
+          <CardContent className="grid grid-cols-3 gap-3">
+            <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><p className="text-xs text-slate-600">People from link</p><p className="text-2xl font-black text-violet-700 mt-1">{dashboard.total_referrals ?? selected?.total_referrals ?? 0}</p><p className="mt-1 text-[11px] text-slate-500">{dashboard.total_login_events ?? 0} tracked logins</p></div>
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4"><p className="text-xs text-slate-600">Admin verified</p><p className="text-2xl font-black text-emerald-700 mt-1">{dashboard.verified_referrals ?? selected?.verified_referrals ?? 0}</p></div>
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4"><p className="text-xs text-slate-600">Points</p><p className="text-2xl font-black text-amber-700 mt-1">{dashboard.points ?? selected?.points ?? 0}</p></div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="border-slate-200 bg-white shadow-sm">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2"><Users className="w-4 h-4 text-violet-700" />People attributed to this consultant</CardTitle>
+          <CardDescription>Each Admin-verified referral contributes one point.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          {referrals.length === 0 ? (
+            <p className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-6 text-center text-sm text-slate-500">No people have logged in through this consultant link yet.</p>
+          ) : (
+            <div className="overflow-x-auto rounded-2xl border border-slate-200">
+              <table className="w-full min-w-[860px] text-sm">
+                <thead className="bg-slate-50 text-slate-600"><tr><th className="p-3 text-left">Person</th><th className="p-3 text-left">Role</th><th className="p-3 text-left">Mobile</th><th className="p-3 text-left">First attributed</th><th className="p-3 text-left">Link logins</th><th className="p-3 text-left">Status</th><th className="p-3 text-right">Point</th></tr></thead>
+                <tbody>
+                  {referrals.map((item) => (
+                    <tr key={item.id} className="border-t border-slate-100">
+                      <td className="p-3"><p className="font-semibold text-slate-900">{item.full_name || 'Work2Wish user'}</p><p className="text-xs text-slate-500">{item.email || '—'}</p></td>
+                      <td className="p-3 capitalize">{item.role || '—'}</td>
+                      <td className="p-3">{item.phone || '—'}</td>
+                      <td className="p-3">{item.registered_at ? new Date(item.registered_at).toLocaleString() : '—'}</td>
+                      <td className="p-3 font-semibold text-slate-700">{item.login_count || 1}</td>
+                      <td className="p-3">{item.points_awarded || item.status === 'verified' ? <Badge className="bg-emerald-100 text-emerald-800 border border-emerald-200">Admin Verified</Badge> : <Badge variant="outline" className="border-amber-200 bg-amber-50 text-amber-700">Awaiting verification</Badge>}</td>
+                      <td className="p-3 text-right font-bold text-amber-700">{item.points_awarded ? '+1' : '0'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -2802,37 +3127,38 @@ function ForgotReset({ email, onAuthed, onBack }) {
 function SignupRolePicker({ onPick, onBack }) {
   return (
     <motion.div key="signup-role" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
-      className="min-h-[100dvh] max-h-[100dvh] bg-gradient-to-br from-slate-50 via-white to-sky-50 px-4 py-3 sm:p-6 flex flex-col relative overflow-hidden">
+      className="min-h-[100dvh] max-h-[100dvh] bg-gradient-to-br from-slate-50 via-white to-sky-50 px-4 py-3 sm:p-6 flex flex-col relative overflow-y-auto overflow-x-hidden">
       <GradientMesh />
       <div className="relative z-10 flex items-center justify-between">
         <Button variant="ghost" size="sm" onClick={onBack} className="relative"><ChevronLeft className="w-4 h-4 mr-1" />Back</Button>
       </div>
-      <div className="flex-1 min-h-0 flex flex-col items-center justify-center max-w-3xl mx-auto w-full relative">
+      <div className="flex-1 min-h-0 flex flex-col items-center justify-center max-w-5xl mx-auto w-full relative">
         <motion.h1 className="text-2xl sm:text-5xl font-extrabold text-center leading-tight"
           initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }}>
           How will you use Work2Wish?
         </motion.h1>
         <p className="text-muted-foreground mt-2 text-center">Choose your role — you can't change this later.</p>
 
-        <div className="grid sm:grid-cols-2 gap-3 sm:gap-5 mt-5 sm:mt-10 w-full" style={{ perspective: 1200 }}>
+        <div className="grid sm:grid-cols-3 gap-3 sm:gap-5 mt-5 sm:mt-10 w-full" style={{ perspective: 1200 }}>
           {[
             { role: 'worker', icon: HardHat, color: 'indigo', title: "I'm a worker", sub: 'Find daily / short-term jobs near me' },
             { role: 'employer', icon: Briefcase, color: 'emerald', title: "I'm an employer", sub: 'Post jobs and hire skilled workers' },
+            { role: 'consultant', icon: Users, color: 'violet', title: "I'm a consultant", sub: 'Refer people and earn points when they are verified' },
           ].map((r, i) => (
             <motion.div key={r.role}
-              initial={{ y: 30, opacity: 0, rotateY: i === 0 ? -20 : 20 }}
+              initial={{ y: 30, opacity: 0, rotateY: i === 0 ? -20 : i === 1 ? 0 : 20 }}
               animate={{ y: 0, opacity: 1, rotateY: 0 }}
               transition={{ delay: 0.1 + i * 0.1, type: 'spring', stiffness: 90 }}>
               <Tilt3D max={20}>
                 <button onClick={() => onPick(r.role)}
-                  className={`w-full text-left p-4 sm:p-7 bg-white rounded-2xl border-2 hover:border-${r.color}-500 hover:shadow-2xl transition-shadow group block`}>
-                  <motion.div className={`w-12 h-12 sm:w-16 sm:h-16 rounded-2xl grid place-items-center text-white ${r.color === 'indigo' ? 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]' : 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]'} shadow-lg`}
+                  className={`w-full text-left p-4 sm:p-7 bg-white rounded-2xl border-2 hover:shadow-2xl transition-shadow group block ${r.color === 'indigo' ? 'hover:border-indigo-500' : r.color === 'emerald' ? 'hover:border-emerald-500' : 'hover:border-violet-500'}`}>
+                  <motion.div className={`w-12 h-12 sm:w-16 sm:h-16 rounded-2xl grid place-items-center text-white ${r.color === 'indigo' ? 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]' : r.color === 'emerald' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : 'bg-gradient-to-br from-violet-600 to-purple-500'} shadow-lg`}
                     whileHover={{ rotate: [0, -8, 8, 0] }} transition={{ duration: 0.6 }}>
                     <r.icon className="w-8 h-8" />
                   </motion.div>
                   <p className="font-bold text-xl sm:text-2xl mt-3 sm:mt-5">{r.title}</p>
                   <p className="text-sm text-muted-foreground mt-1">{r.sub}</p>
-                  <div className={`mt-3 sm:mt-5 inline-flex items-center text-sm font-semibold ${r.color === 'indigo' ? 'text-indigo-600' : 'text-emerald-600'} group-hover:translate-x-1 transition-transform`}>
+                  <div className={`mt-3 sm:mt-5 inline-flex items-center text-sm font-semibold ${r.color === 'indigo' ? 'text-indigo-600' : r.color === 'emerald' ? 'text-emerald-600' : 'text-violet-600'} group-hover:translate-x-1 transition-transform`}>
                     Continue <ArrowRight className="w-4 h-4 ml-1" />
                   </div>
                 </button>
@@ -2883,7 +3209,7 @@ function SignupForm({ data, onChange, onSent, onBack }) {
   };
 
   const strength = getPasswordStrength(data.password || '');
-  const accent = data.role === 'employer' ? 'emerald' : 'indigo';
+  const accent = data.role === 'employer' ? 'emerald' : data.role === 'consultant' ? 'violet' : 'indigo';
   return (
     <motion.div key="signup-form" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
       className="min-h-screen bg-gradient-to-br from-slate-50 to-white p-6 flex flex-col">
@@ -2892,9 +3218,9 @@ function SignupForm({ data, onChange, onSent, onBack }) {
         <Card className="w-full max-w-md shadow-xl border-0 ring-1 ring-black/5">
           <CardHeader className="text-center pb-2">
             <div className={`w-14 h-14 mx-auto rounded-2xl grid place-items-center text-white mb-3 ${
-              data.role === 'employer' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]'
+              data.role === 'employer' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : data.role === 'consultant' ? 'bg-gradient-to-br from-violet-600 to-purple-500' : 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]'
             }`}>
-              {data.role === 'employer' ? <Briefcase className="w-7 h-7" /> : <HardHat className="w-7 h-7" />}
+              {data.role === 'employer' ? <Briefcase className="w-7 h-7" /> : data.role === 'consultant' ? <Users className="w-7 h-7" /> : <HardHat className="w-7 h-7" />}
             </div>
             <CardTitle className="text-2xl">Create your account</CardTitle>
             <CardDescription>
@@ -2969,7 +3295,7 @@ function SignupForm({ data, onChange, onSent, onBack }) {
                 )}
               </div>
               <Button type="submit" disabled={busy}
-                      className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                      className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : accent === 'violet' ? 'bg-violet-600 hover:bg-violet-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
                 {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <>Send OTP <Send className="w-4 h-4 ml-2" /></>}
               </Button>
               <p className="text-xs text-muted-foreground text-center">A 6-digit code will be sent to your email. Company addresses hosted on Zoho, Outlook / Microsoft 365, Google Workspace and custom domains are supported.</p>
@@ -3029,7 +3355,7 @@ function SignupOTP({ data, onAuthed, onBack }) {
     } catch (e) { toast.error(e.message); } finally { setResending(false); }
   };
 
-  const accent = data.role === 'employer' ? 'emerald' : 'indigo';
+  const accent = data.role === 'employer' ? 'emerald' : data.role === 'consultant' ? 'violet' : 'indigo';
 
   return (
     <motion.div key="signup-otp" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
@@ -3039,7 +3365,7 @@ function SignupOTP({ data, onAuthed, onBack }) {
         <Card className="w-full max-w-md shadow-xl border-0 ring-1 ring-black/5">
           <CardHeader className="text-center pb-2">
             <motion.div className={`w-14 h-14 mx-auto rounded-2xl grid place-items-center text-white mb-3 ${
-              accent === 'emerald' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]'
+              accent === 'emerald' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : accent === 'violet' ? 'bg-gradient-to-br from-violet-600 to-purple-500' : 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]'
             }`}
               animate={{ scale: [1, 1.05, 1] }} transition={{ duration: 2, repeat: Infinity }}>
               <Mail className="w-7 h-7" />
@@ -3056,7 +3382,7 @@ function SignupOTP({ data, onAuthed, onBack }) {
               </InputOTP>
             </div>
             <Button onClick={verify} disabled={busy || code.length !== 6}
-                    className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
+                    className={`w-full h-11 ${accent === 'emerald' ? 'bg-emerald-600 hover:bg-emerald-700' : accent === 'violet' ? 'bg-violet-600 hover:bg-violet-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}>
               {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <>Verify & continue <CheckCircle2 className="w-4 h-4 ml-2" /></>}
             </Button>
             <div className="text-center text-sm text-muted-foreground">
@@ -3090,15 +3416,16 @@ function OAuthRolePicker({ ctx, onPick }) {
         <h1 className="text-3xl font-extrabold mt-4">Hi {ctx?.full_name || 'there'}!</h1>
         <p className="text-muted-foreground mt-1">One quick thing — how will you use Work2Wish?</p>
       </div>
-      <div className="grid sm:grid-cols-2 gap-4 mt-8 w-full max-w-2xl">
+      <div className="grid sm:grid-cols-3 gap-4 mt-8 w-full max-w-4xl">
         {[
           { role: 'worker', icon: HardHat, color: 'indigo', title: "I'm a worker", sub: 'Find jobs near me' },
           { role: 'employer', icon: Briefcase, color: 'emerald', title: "I'm an employer", sub: 'Hire workers' },
+          { role: 'consultant', icon: Users, color: 'violet', title: "I'm a consultant", sub: 'Refer people and track verified points' },
         ].map((r) => (
           <motion.button key={r.role} onClick={() => onPick(r.role)}
             whileHover={{ y: -4, scale: 1.02 }} whileTap={{ scale: 0.98 }}
-            className={`text-left p-6 bg-white rounded-2xl border-2 hover:border-${r.color}-500 hover:shadow-xl transition`}>
-            <div className={`w-14 h-14 rounded-2xl grid place-items-center text-white ${r.color === 'indigo' ? 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]' : 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]'}`}>
+            className={`text-left p-6 bg-white rounded-2xl border-2 hover:shadow-xl transition ${r.color === 'indigo' ? 'hover:border-indigo-500' : r.color === 'emerald' ? 'hover:border-emerald-500' : 'hover:border-violet-500'}`}>
+            <div className={`w-14 h-14 rounded-2xl grid place-items-center text-white ${r.color === 'indigo' ? 'bg-gradient-to-br from-[#061a4d] to-[#0b8fe8]' : r.color === 'emerald' ? 'bg-gradient-to-br from-[#061a4d] to-[#21b7ff]' : 'bg-gradient-to-br from-violet-600 to-purple-500'}`}>
               <r.icon className="w-7 h-7" />
             </div>
             <p className="font-bold text-xl mt-4">{r.title}</p>
@@ -6811,7 +7138,7 @@ function hasBankDetailsChanged(current = {}, saved = {}) {
 }
 
 
-const PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'age', 'gender', 'skills', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known', 'available', 'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'previous_employer_reference', 'bio', 'resume_url'];
+const PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'age', 'gender', 'skills', 'experience_value', 'experience_unit', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known', 'available', 'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'previous_employer_reference', 'bio', 'resume_url'];
 const EMPLOYER_PROFILE_VERIFY_FIELDS = ['full_name', 'phone', 'company_name', 'industry', 'company_size', 'hr_contact', 'official_email', 'company_address', 'gst_number', 'pan_number', 'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'description'];
 // Compare only fields that belong to the Worker Verification card.
 // Selfie fields are verified by the separate Selfie card and must not keep
@@ -6824,14 +7151,34 @@ function normalizeVerifyValue(key, value) {
   const text = String(value ?? '').trim();
   if (['pan_number', 'gst_number', 'ifsc_code'].includes(key)) return text.toUpperCase().replace(/\s/g, '');
   if (key === 'aadhaar_number' || key === 'phone') return text.replace(/\D/g, '');
-  if (['age', 'experience_years', 'expected_daily_wage', 'latitude', 'longitude'].includes(key)) return text === '' ? '' : String(Number(text));
+  if (['age', 'experience_value', 'experience_years', 'expected_daily_wage', 'latitude', 'longitude'].includes(key)) return text === '' ? '' : String(Number(text));
   if (key === 'available') return String(value === true || value === 'true');
   return text;
 }
 
 function extraValueForKey(profile = {}, extra = {}, key) {
   if (key === 'full_name' || key === 'phone') return profile?.[key] || '';
+  if (key === 'experience_value') return extra?.experience_value ?? extra?.experience_years ?? '';
+  if (key === 'experience_unit') return extra?.experience_unit || 'years';
   return extra?.[key] ?? '';
+}
+
+function normalizeExperienceUnit(value) {
+  return String(value || '').toLowerCase() === 'months' ? 'months' : 'years';
+}
+
+function workerExperienceValue(data = {}) {
+  const unit = normalizeExperienceUnit(data?.experience_unit);
+  const rawValue = data?.experience_value ?? data?.experience_years ?? 0;
+  const value = Number(rawValue);
+  return { value: Number.isFinite(value) && value >= 0 ? value : 0, unit };
+}
+
+function formatWorkerExperience(data = {}) {
+  const { value, unit } = workerExperienceValue(data);
+  const clean = Number.isInteger(value) ? String(value) : String(Number(value.toFixed(1)));
+  const label = unit === 'months' ? (value === 1 ? 'month' : 'months') : (value === 1 ? 'year' : 'years');
+  return `${clean} ${label}`;
 }
 
 function hasVerifySectionChanged(fields = [], current = {}, profile = {}, extra = {}) {
@@ -7176,6 +7523,8 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
       phone: cleanIndianPhone10(me.profile?.phone) || '',
       age: me.extra?.age || '',
       skills: (me.extra?.skills || []).join(', '),
+      experience_value: me.extra?.experience_value ?? me.extra?.experience_years ?? '',
+      experience_unit: normalizeExperienceUnit(me.extra?.experience_unit),
       experience_years: me.extra?.experience_years ?? '',
       experience_level: me.extra?.experience_level || '',
       expected_daily_wage: me.extra?.expected_daily_wage ?? '',
@@ -7240,7 +7589,11 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
     age: form.age ? Number(form.age) : null,
     gender: form.gender || '',
     skills: typeof form.skills === 'string' ? form.skills.split(',').map(s => s.trim()).filter(Boolean) : (form.skills || []),
-    experience_years: Number(form.experience_years) || 0,
+    experience_value: Math.max(0, Number(form.experience_value ?? form.experience_years) || 0),
+    experience_unit: normalizeExperienceUnit(form.experience_unit),
+    experience_years: normalizeExperienceUnit(form.experience_unit) === 'months'
+      ? Math.floor(Math.max(0, Number(form.experience_value ?? form.experience_years) || 0) / 12)
+      : Math.floor(Math.max(0, Number(form.experience_value ?? form.experience_years) || 0)),
     experience_level: form.experience_level || 'beginner',
     expected_daily_wage: Number(form.expected_daily_wage) || 0,
     languages_known: typeof form.languages_known === 'string' ? form.languages_known.split(',').map(s => s.trim()).filter(Boolean) : (form.languages_known || []),
@@ -7549,7 +7902,38 @@ function WorkerProfile({ token, me, onSaved, onLogout }) {
               <SelectContent><SelectItem value="male">Male</SelectItem><SelectItem value="female">Female</SelectItem><SelectItem value="other">Other</SelectItem></SelectContent>
             </Select>
           </div>
-          <Field label="Experience (years)" v={form.experience_years} on={(v) => setForm(f => ({ ...f, experience_years: v }))} type="number" />
+          <div>
+            <Label>Experience<span className="text-red-500 ml-0.5">*</span></Label>
+            <div className="mt-1 flex h-10 overflow-hidden rounded-md border border-input bg-background focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2">
+              <Input
+                type="number"
+                min="0"
+                step="1"
+                value={form.experience_value ?? ''}
+                onChange={(e) => setForm(f => ({ ...f, experience_value: e.target.value }))}
+                className="h-full flex-1 rounded-none border-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+                aria-label={`Experience in ${normalizeExperienceUnit(form.experience_unit)}`}
+              />
+              <div className="flex shrink-0 border-l border-input bg-slate-50 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setForm(f => ({ ...f, experience_unit: 'years' }))}
+                  className={`rounded px-2.5 text-xs font-semibold transition ${normalizeExperienceUnit(form.experience_unit) === 'years' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+                  aria-pressed={normalizeExperienceUnit(form.experience_unit) === 'years'}
+                >
+                  Years
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setForm(f => ({ ...f, experience_unit: 'months' }))}
+                  className={`rounded px-2.5 text-xs font-semibold transition ${normalizeExperienceUnit(form.experience_unit) === 'months' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'}`}
+                  aria-pressed={normalizeExperienceUnit(form.experience_unit) === 'months'}
+                >
+                  Months
+                </button>
+              </div>
+            </div>
+          </div>
           <div>
             <Label>Experience level<span className="text-red-500 ml-0.5">*</span></Label>
             <Select value={form.experience_level || 'beginner'} onValueChange={(v) => setForm(f => ({ ...f, experience_level: v }))}>

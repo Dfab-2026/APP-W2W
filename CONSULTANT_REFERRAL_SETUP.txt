@@ -1,0 +1,28 @@
+WORK2WISH CONSULTANT REFERRAL SETUP
+===================================
+
+This update adds the Consultant account role and referral-point flow.
+
+ONE REQUIRED DATABASE STEP
+--------------------------
+1. Open Supabase -> SQL Editor -> New query.
+2. Open CONSULTANT_REFERRAL_FEATURE.sql from this project.
+3. Copy the complete SQL into Supabase and click Run.
+4. Run this once before creating the first Consultant account.
+
+No new environment variable is required for the Consultant feature.
+
+WHAT THE FLOW DOES
+------------------
+- Create Account now includes Worker, Employer and Consultant.
+- Consultant uses the existing email OTP verification/signup flow.
+- Every Consultant receives a unique, non-guessable Work2Wish referral link.
+- A Worker or Employer who opens that link and authenticates is attributed to the first Consultant link used.
+- Repeat logins through the same Consultant link increase that person's tracked link-login count but do not create duplicate referral points.
+- When Admin completes final verification for that referred Worker/Employer, the Consultant sees an Admin Verified badge and receives exactly 1 active point for that person.
+- If Admin reopens/unapproves that user's verification, the point returns to pending until final approval is restored.
+- Admin can view Consultant account details, referral code/link, referred people, verified count and points.
+
+EXISTING WORKER / EMPLOYER / ADMIN FLOWS
+----------------------------------------
+The feature uses separate consultant tables and API branches. Existing Worker, Employer and Admin workflows are preserved.

@@ -9,7 +9,7 @@ create extension if not exists "pgcrypto";
 create table if not exists public.user_profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   email text unique not null,
-  role text not null check (role in ('worker','employer','admin')),
+  role text not null check (role in ('worker','employer','consultant','admin')),
   full_name text,
   phone text,
   photo_url text,
@@ -23,6 +23,8 @@ create table if not exists public.workers (
   age int,
   skills text[] default '{}',
   experience_years int default 0,
+  experience_value numeric default 0,
+  experience_unit text default 'years',
   expected_daily_wage numeric default 0,
   location_text text,
   latitude double precision,
@@ -47,6 +49,30 @@ create table if not exists public.employers (
   verified boolean default false,
   created_at timestamptz default now()
 );
+
+-- ---------------- consultants -------------------------------------------
+create table if not exists public.consultants (
+  user_id uuid primary key references public.user_profiles(id) on delete cascade,
+  referral_code text not null unique,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.consultant_referrals (
+  id uuid primary key default gen_random_uuid(),
+  consultant_id uuid not null references public.consultants(user_id) on delete cascade,
+  referred_user_id uuid not null references public.user_profiles(id) on delete cascade,
+  referred_role text not null check (referred_role in ('worker','employer')),
+  status text not null default 'registered' check (status in ('registered','verified')),
+  points_awarded boolean not null default false,
+  registered_at timestamptz default now(),
+  last_login_at timestamptz default now(),
+  login_count integer not null default 1,
+  verified_at timestamptz,
+  updated_at timestamptz default now(),
+  unique(referred_user_id)
+);
+create index if not exists idx_consultant_referrals_consultant on public.consultant_referrals(consultant_id, registered_at desc);
 
 -- ---------------- jobs --------------------------------------------------
 create table if not exists public.jobs (
@@ -150,6 +176,8 @@ on conflict (id) do nothing;
 alter table public.user_profiles enable row level security;
 alter table public.workers       enable row level security;
 alter table public.employers     enable row level security;
+alter table public.consultants    enable row level security;
+alter table public.consultant_referrals enable row level security;
 alter table public.jobs          enable row level security;
 alter table public.applications  enable row level security;
 alter table public.messages      enable row level security;

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getAdmin, getUserFromRequest } from '@/lib/supabase/admin';
 import { Resend } from 'resend';
+import { randomBytes } from 'node:crypto';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -513,6 +514,103 @@ async function generateLoginId(admin) {
   return String(Date.now()).slice(-6);
 }
 
+function consultantReferralCode() {
+  return `W2W-C-${randomBytes(7).toString('hex').toUpperCase()}`;
+}
+
+async function ensureConsultantFeatureReady(admin) {
+  const { error } = await admin.from('consultants').select('user_id').limit(1);
+  if (!error) return null;
+  return new Error('Consultant feature is not configured yet. Run CONSULTANT_REFERRAL_FEATURE.sql in Supabase, then try again.');
+}
+
+async function createRoleRecord(admin, userId, role, loginId) {
+  if (role === 'worker') return admin.from('workers').insert({ user_id: userId });
+  if (role === 'employer') return admin.from('employers').insert({ user_id: userId });
+  if (role === 'consultant') {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const referral_code = consultantReferralCode();
+      const result = await admin.from('consultants').insert({ user_id: userId, referral_code });
+      if (!result.error || result.error?.code !== '23505') return result;
+    }
+    return { data: null, error: new Error('Unable to generate a unique consultant referral code') };
+  }
+  return { data: null, error: new Error('Invalid role') };
+}
+
+async function getConsultantDashboardData(admin, consultantId) {
+  const [{ data: consultant, error: consultantError }, { data: referrals, error: referralError }] = await Promise.all([
+    admin.from('consultants').select('*').eq('user_id', consultantId).maybeSingle(),
+    admin.from('consultant_referrals').select('*').eq('consultant_id', consultantId).order('registered_at', { ascending: false }),
+  ]);
+  if (consultantError) throw consultantError;
+  if (referralError) throw referralError;
+  if (!consultant) return null;
+
+  const rows = referrals || [];
+  const referredIds = [...new Set(rows.map((row) => row.referred_user_id).filter(Boolean))];
+  const profileById = new Map();
+  if (referredIds.length) {
+    const { data: profiles, error } = await admin
+      .from('user_profiles')
+      .select('id,full_name,email,role,phone,photo_url,created_at')
+      .in('id', referredIds);
+    if (error) throw error;
+    for (const profile of profiles || []) profileById.set(profile.id, profile);
+  }
+
+  const items = rows.map((row) => {
+    const profile = profileById.get(row.referred_user_id) || {};
+    return {
+      id: row.id,
+      referred_user_id: row.referred_user_id,
+      full_name: profile.full_name || 'Work2Wish user',
+      email: profile.email || null,
+      phone: profile.phone || null,
+      photo_url: profile.photo_url || null,
+      role: profile.role || row.referred_role,
+      status: row.status || (row.points_awarded ? 'verified' : 'registered'),
+      points_awarded: !!row.points_awarded,
+      registered_at: row.registered_at,
+      last_login_at: row.last_login_at,
+      login_count: Number(row.login_count || 1),
+      verified_at: row.verified_at,
+    };
+  });
+
+  const verifiedReferrals = items.filter((item) => item.points_awarded || item.status === 'verified').length;
+  const totalLoginEvents = items.reduce((sum, item) => sum + Math.max(1, Number(item.login_count || 1)), 0);
+  return {
+    consultant,
+    referral_code: consultant.referral_code,
+    total_referrals: items.length,
+    total_login_events: totalLoginEvents,
+    verified_referrals: verifiedReferrals,
+    points: verifiedReferrals,
+    referrals: items,
+  };
+}
+
+async function syncConsultantReferralVerification(admin, referredUserId, verified) {
+  const { data: referral, error } = await admin
+    .from('consultant_referrals')
+    .select('id,consultant_id,points_awarded')
+    .eq('referred_user_id', referredUserId)
+    .maybeSingle();
+  if (error || !referral) return;
+
+  const now = new Date().toISOString();
+  const next = verified
+    ? { status: 'verified', points_awarded: true, verified_at: now, updated_at: now }
+    : { status: 'registered', points_awarded: false, verified_at: null, updated_at: now };
+  const { error: updateError } = await admin.from('consultant_referrals').update(next).eq('id', referral.id);
+  if (updateError) return;
+
+  if (verified && !referral.points_awarded) {
+    await notify(admin, referral.consultant_id, 'Consultant point earned', 'One person from your referral link was verified by Admin. You earned 1 point.', 'consultant_point', referredUserId);
+  }
+}
+
 function otpEmailHtml(code, name) {
   return `
   <div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;background:#f8fafc">
@@ -615,7 +713,11 @@ async function route(request, { params }) {
       const email = String(rawEmail || '').trim().toLowerCase();
       if (!email || !password || !role || !phone) return err('email, mobile number, password, role required', 400);
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err('Enter a valid email address', 400);
-      if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
+      if (!['worker', 'employer', 'consultant'].includes(role)) return err('Invalid role', 400);
+      if (role === 'consultant') {
+        const setupError = await ensureConsultantFeatureReady(admin);
+        if (setupError) return err(setupError.message, 503);
+      }
 
       // Any valid email provider is supported here (Zoho, Microsoft 365, Google Workspace, custom domains, etc.).
       // Google OAuth remains separate and is only for accounts Google can authenticate.
@@ -687,11 +789,8 @@ async function route(request, { params }) {
         phone: phone || null,
         login_id,
       });
-      if (role === 'worker') {
-        await admin.from('workers').insert({ user_id: user.id });
-      } else {
-        await admin.from('employers').insert({ user_id: user.id });
-      }
+      const roleRecord = await createRoleRecord(admin, user.id, role, login_id);
+      if (roleRecord?.error) return err(roleRecord.error.message || 'Unable to create role profile', 400);
 
       // Sign in
       const supaAnon = (await import('@supabase/supabase-js')).createClient(
@@ -815,7 +914,11 @@ async function route(request, { params }) {
       const { email, password, role, full_name, phone: rawPhone } = await request.json();
       const phone = normalizePhone(rawPhone);
       if (!email || !password || !role || !phone) return err('email, mobile number, password, role required', 400);
-      if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
+      if (!['worker', 'employer', 'consultant'].includes(role)) return err('Invalid role', 400);
+      if (role === 'consultant') {
+        const setupError = await ensureConsultantFeatureReady(admin);
+        if (setupError) return err(setupError.message, 503);
+      }
 
       const { data: created, error: cErr } = await admin.auth.admin.createUser({
         email, password, email_confirm: true,
@@ -827,8 +930,8 @@ async function route(request, { params }) {
       await admin.from('user_profiles').insert({
         id: user.id, email, phone, role, full_name: full_name || null, login_id,
       });
-      if (role === 'worker') await admin.from('workers').insert({ user_id: user.id });
-      else                   await admin.from('employers').insert({ user_id: user.id });
+      const roleRecord = await createRoleRecord(admin, user.id, role, login_id);
+      if (roleRecord?.error) return err(roleRecord.error.message || 'Unable to create role profile', 400);
 
       const supaAnon = (await import('@supabase/supabase-js')).createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -855,7 +958,11 @@ async function route(request, { params }) {
       }
       // No profile yet — need role
       if (!chosenRole) return json({ needs_role: true, email: user.email, full_name: user.user_metadata?.full_name || user.user_metadata?.name });
-      if (!['worker', 'employer'].includes(chosenRole)) return err('Invalid role', 400);
+      if (!['worker', 'employer', 'consultant'].includes(chosenRole)) return err('Invalid role', 400);
+      if (chosenRole === 'consultant') {
+        const setupError = await ensureConsultantFeatureReady(admin);
+        if (setupError) return err(setupError.message, 503);
+      }
 
       const login_id = await generateLoginId(admin);
       await admin.from('user_profiles').insert({
@@ -866,8 +973,8 @@ async function route(request, { params }) {
         photo_url: user.user_metadata?.avatar_url || user.user_metadata?.picture || null,
         login_id,
       });
-      if (chosenRole === 'worker') await admin.from('workers').insert({ user_id: user.id });
-      else                          await admin.from('employers').insert({ user_id: user.id });
+      const roleRecord = await createRoleRecord(admin, user.id, chosenRole, login_id);
+      if (roleRecord?.error) return err(roleRecord.error.message || 'Unable to create role profile', 400);
       return json({ ok: true, role: chosenRole, login_id });
     }
 
@@ -879,7 +986,11 @@ async function route(request, { params }) {
       if (!email || !password || !role || !phone || !google_access_token) {
         return err('email, mobile number, password, role, google_access_token required', 400);
       }
-      if (!['worker', 'employer'].includes(role)) return err('Invalid role', 400);
+      if (!['worker', 'employer', 'consultant'].includes(role)) return err('Invalid role', 400);
+      if (role === 'consultant') {
+        const setupError = await ensureConsultantFeatureReady(admin);
+        if (setupError) return err(setupError.message, 503);
+      }
 
       const { data: u } = await admin.auth.getUser(google_access_token);
       if (!u?.user) return err('Invalid Google session', 401);
@@ -969,8 +1080,8 @@ async function route(request, { params }) {
       });
       if (profileErr) return err(profileErr.message, 400);
 
-      if (role === 'worker') await admin.from('workers').insert({ user_id });
-      else await admin.from('employers').insert({ user_id });
+      const roleRecord = await createRoleRecord(admin, user_id, role, login_id);
+      if (roleRecord?.error) return err(roleRecord.error.message || 'Unable to create role profile', 400);
 
       const supaAnon = (await import('@supabase/supabase-js')).createClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL,
@@ -1193,6 +1304,95 @@ async function route(request, { params }) {
 
 
 
+    // ---------- Consultant referral flow ----------
+    if (path === 'consultant/referrals/claim' && method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const referralCode = String(body.referral_code || '').trim().toUpperCase();
+      if (!referralCode) return err('Referral code required', 400);
+
+      const { data: referredProfile, error: profileError } = await admin
+        .from('user_profiles')
+        .select('id,role,blocked')
+        .eq('id', me.id)
+        .maybeSingle();
+      if (profileError || !referredProfile) return err('User profile not found', 404);
+      if (referredProfile.blocked) return err('Account blocked', 403);
+      if (!['worker', 'employer'].includes(referredProfile.role)) {
+        return json({ ok: true, attributed: false, reason: 'role_not_eligible' });
+      }
+
+      const { data: consultant, error: consultantError } = await admin
+        .from('consultants')
+        .select('user_id,referral_code')
+        .eq('referral_code', referralCode)
+        .maybeSingle();
+      if (consultantError) return err(consultantError.message, 400);
+      if (!consultant) return err('Invalid consultant referral link', 404);
+      if (consultant.user_id === me.id) return json({ ok: true, attributed: false, reason: 'self_referral' });
+
+      const { data: existing, error: existingError } = await admin
+        .from('consultant_referrals')
+        .select('*')
+        .eq('referred_user_id', me.id)
+        .maybeSingle();
+      if (existingError) return err(existingError.message, 400);
+      if (existing) {
+        if (existing.consultant_id === consultant.user_id) {
+          const now = new Date().toISOString();
+          await admin.from('consultant_referrals').update({
+            last_login_at: now,
+            login_count: Number(existing.login_count || 1) + 1,
+            updated_at: now,
+          }).eq('id', existing.id);
+          return json({ ok: true, attributed: true, existing: true });
+        }
+        return json({ ok: true, attributed: false, reason: 'already_attributed' });
+      }
+
+      const roleTable = referredProfile.role === 'worker' ? 'workers' : 'employers';
+      const { data: roleRow } = await admin.from(roleTable).select('verified').eq('user_id', me.id).maybeSingle();
+      const alreadyVerified = roleRow?.verified === true;
+      const now = new Date().toISOString();
+      const { error: insertError } = await admin.from('consultant_referrals').insert({
+        consultant_id: consultant.user_id,
+        referred_user_id: me.id,
+        referred_role: referredProfile.role,
+        status: alreadyVerified ? 'verified' : 'registered',
+        points_awarded: alreadyVerified,
+        registered_at: now,
+        last_login_at: now,
+        login_count: 1,
+        verified_at: alreadyVerified ? now : null,
+        updated_at: now,
+      });
+      if (insertError) return err(insertError.message, 400);
+
+      await notify(admin, consultant.user_id, 'New referral joined', 'A person logged in to Work2Wish using your consultant link.', 'consultant_referral', me.id);
+      if (alreadyVerified) {
+        await notify(admin, consultant.user_id, 'Consultant point earned', 'Your referred Work2Wish user is already Admin verified. You earned 1 point.', 'consultant_point', me.id);
+      }
+      return json({ ok: true, attributed: true, verified: alreadyVerified });
+    }
+
+    if (path === 'consultant/dashboard' && method === 'GET') {
+      const { data: profile, error: profileError } = await admin
+        .from('user_profiles')
+        .select('id,email,phone,full_name,role,blocked,login_id,created_at')
+        .eq('id', me.id)
+        .maybeSingle();
+      if (profileError || !profile) return err('User profile not found', 404);
+      if (profile.blocked) return err('Your account has been blocked by admin.', 403);
+      if (profile.role !== 'consultant') return err('Consultant access required', 403);
+      try {
+        const dashboard = await getConsultantDashboardData(admin, me.id);
+        if (!dashboard) return err('Consultant profile not configured. Run CONSULTANT_REFERRAL_FEATURE.sql.', 500);
+        return json({ profile, ...dashboard });
+      } catch (e) {
+        return err(e?.message || 'Unable to load consultant dashboard', 400);
+      }
+    }
+
+
     // ---------- One-time free trial eligibility / claim ----------
     async function getTrialIdentity(role) {
       const { data: profile } = await admin
@@ -1382,6 +1582,8 @@ async function route(request, { params }) {
       const ownedJobIds = (ownedJobs || []).map(j => j.id);
       if (ownedJobIds.length) await admin.from('applications').delete().in('job_id', ownedJobIds);
       await admin.from('jobs').delete().eq('employer_id', userId);
+      await admin.from('consultant_referrals').delete().or(`consultant_id.eq.${userId},referred_user_id.eq.${userId}`);
+      await admin.from('consultants').delete().eq('user_id', userId);
       await admin.from('workers').delete().eq('user_id', userId);
       await admin.from('employers').delete().eq('user_id', userId);
       await admin.from('user_profiles').delete().eq('id', userId);
@@ -1394,12 +1596,16 @@ async function route(request, { params }) {
       const { data: profile } = await admin.from('user_profiles').select('*').eq('id', userId).maybeSingle();
       if (!profile) return null;
       let extra = null;
+      let consultantDashboard = null;
       if (profile.role === 'worker') {
         const { data } = await admin.from('workers').select('*').eq('user_id', userId).maybeSingle();
         extra = data;
       } else if (profile.role === 'employer') {
         const { data } = await admin.from('employers').select('*').eq('user_id', userId).maybeSingle();
         extra = data;
+      } else if (profile.role === 'consultant') {
+        consultantDashboard = await getConsultantDashboardData(admin, userId);
+        extra = consultantDashboard?.consultant || null;
       }
       let durableStatuses = {};
       let verificationSectionRows = [];
@@ -1411,6 +1617,16 @@ async function route(request, { params }) {
       return {
         ...profile,
         ...(extra || {}),
+        ...(consultantDashboard ? {
+          consultant_dashboard: {
+            referral_code: consultantDashboard.referral_code,
+            total_referrals: consultantDashboard.total_referrals,
+            total_login_events: consultantDashboard.total_login_events,
+            verified_referrals: consultantDashboard.verified_referrals,
+            points: consultantDashboard.points,
+            referrals: consultantDashboard.referrals,
+          },
+        } : {}),
         section_statuses: { ...((extra || {}).section_statuses || {}), ...durableStatuses },
         verification_section_rows: verificationSectionRows,
       };
@@ -1430,6 +1646,7 @@ async function route(request, { params }) {
       const profileRows = profiles || [];
       const workerIds = profileRows.filter((p) => p.role === 'worker').map((p) => p.id);
       const employerIds = profileRows.filter((p) => p.role === 'employer').map((p) => p.id);
+      const consultantIds = profileRows.filter((p) => p.role === 'consultant').map((p) => p.id);
       const allIds = profileRows.map((p) => p.id);
 
       const workerPromise = workerIds.length
@@ -1438,13 +1655,21 @@ async function route(request, { params }) {
       const employerPromise = employerIds.length
         ? admin.from('employers').select('*').in('user_id', employerIds)
         : Promise.resolve({ data: [], error: null });
+      const consultantPromise = consultantIds.length
+        ? admin.from('consultants').select('*').in('user_id', consultantIds)
+        : Promise.resolve({ data: [], error: null });
+      const referralPromise = consultantIds.length
+        ? admin.from('consultant_referrals').select('consultant_id,status,points_awarded').in('consultant_id', consultantIds)
+        : Promise.resolve({ data: [], error: null });
       const sectionPromise = allIds.length
         ? admin.from('user_verification_sections').select('user_id,section,status,submitted_at,verified_at,verified_by,updated_at').in('user_id', allIds)
         : Promise.resolve({ data: [], error: null });
 
-      const [workerResult, employerResult, sectionResult] = await Promise.all([
+      const [workerResult, employerResult, consultantResult, referralResult, sectionResult] = await Promise.all([
         workerPromise,
         employerPromise,
+        consultantPromise,
+        referralPromise,
         sectionPromise,
       ]);
 
@@ -1453,6 +1678,15 @@ async function route(request, { params }) {
       // only by missing role-specific fields, matching the old fallback behavior.
       const workersByUser = new Map((workerResult?.data || []).map((row) => [row.user_id, row]));
       const employersByUser = new Map((employerResult?.data || []).map((row) => [row.user_id, row]));
+      const consultantsByUser = new Map((consultantResult?.data || []).map((row) => [row.user_id, row]));
+      const consultantStatsByUser = new Map();
+      for (const row of referralResult?.data || []) {
+        const current = consultantStatsByUser.get(row.consultant_id) || { total_referrals: 0, verified_referrals: 0, points: 0 };
+        current.total_referrals += 1;
+        if (row.status === 'verified' || row.points_awarded) current.verified_referrals += 1;
+        if (row.points_awarded) current.points += 1;
+        consultantStatsByUser.set(row.consultant_id, current);
+      }
       const sectionStatusesByUser = new Map();
       const sectionRowsByUser = new Map();
       if (!sectionResult?.error) {
@@ -1470,11 +1704,17 @@ async function route(request, { params }) {
           ? workersByUser.get(profile.id)
           : profile.role === 'employer'
             ? employersByUser.get(profile.id)
-            : null;
+            : profile.role === 'consultant'
+              ? consultantsByUser.get(profile.id)
+              : null;
         const durableStatuses = sectionStatusesByUser.get(profile.id) || {};
+        const consultantStats = profile.role === 'consultant'
+          ? (consultantStatsByUser.get(profile.id) || { total_referrals: 0, verified_referrals: 0, points: 0 })
+          : null;
         return {
           ...profile,
           ...(extra || {}),
+          ...(consultantStats || {}),
           section_statuses: { ...((extra || {}).section_statuses || {}), ...durableStatuses },
           verification_section_rows: sectionRowsByUser.get(profile.id) || [],
         };
@@ -1487,8 +1727,8 @@ async function route(request, { params }) {
       // review data becomes available.
       users = users.map((user) => {
         const submittedForReview = isSubmittedForAdminReview(user);
-        if (submittedForReview || user.role === 'admin') {
-          return { ...user, submitted_for_review: submittedForReview };
+        if (submittedForReview || user.role === 'admin' || user.role === 'consultant') {
+          return { ...user, submitted_for_review: user.role === 'consultant' ? true : submittedForReview };
         }
         return {
           id: user.id,
@@ -1520,7 +1760,7 @@ async function route(request, { params }) {
         else if (statusFilter === 'unverified') users = users.filter((u) => !u.verified);
       }
       if (search) {
-        users = users.filter((u) => `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
+        users = users.filter((u) => `${u.email || ''} ${u.phone || ''} ${u.full_name || ''} ${u.company_name || ''} ${u.role || ''} ${u.login_id || ''} ${u.location_text || ''} ${u.address || ''} ${u.company_address || ''} ${u.aadhaar_number || ''} ${u.pan_number || ''} ${u.gst_number || ''} ${u.referral_code || ''} ${u.verification_status || ''}`.toLowerCase().includes(search));
       }
 
       // Show newly submitted verification requests at the top of the admin table.
@@ -1541,7 +1781,7 @@ async function route(request, { params }) {
       const userId = path.split('/')[2];
       const user = await getUserAdminDetail(userId);
       if (!user) return err('User not found', 404);
-      if (!isSubmittedForAdminReview(user)) return err('Profile has not been submitted for verification', 404);
+      if (user.role !== 'consultant' && !isSubmittedForAdminReview(user)) return err('Profile has not been submitted for verification', 404);
       let jobs = [], applications = [], activity = [];
       try {
         if (user.role === 'employer') {
@@ -1615,6 +1855,7 @@ async function route(request, { params }) {
       }
       if (error) return err(error.message, 400);
 
+      await syncConsultantReferralVerification(admin, userId, verified);
       await notify(admin, userId, verified ? 'Account verified' : 'Verification update', verified ? 'Your Work2Wish account is now verified.' : 'Your verification was not approved. Please update your documents.', 'verification', userId);
       await logActivity(admin, userId, verified ? 'admin_verified_account' : 'admin_rejected_verification', { verified, notes }, me.id);
       await logActivity(admin, me.id, verified ? 'verified_user' : 'rejected_user', { user_id: userId, role: profile.role }, me.id);
@@ -1627,27 +1868,50 @@ async function route(request, { params }) {
       const userId = path.split('/')[2];
       const body = await request.json().catch(() => ({}));
       const section = body.section || 'profile';
+      const approved = body.approved !== false;
       const allowed = ['profile', 'bank', 'verification', 'documents', 'identity', 'location', 'admin_message'];
       if (!allowed.includes(section)) return err('Invalid section', 400);
       const { data: profile } = await admin.from('user_profiles').select('role,email,full_name').eq('id', userId).maybeSingle();
       if (!profile) return err('User not found', 404);
       if (profile.role === 'admin') return err('Admin profile cannot be verified here', 400);
+      if (!body.messageOnly && !['worker', 'employer'].includes(profile.role)) return err('This account type does not use document verification', 400);
       const label = section === 'bank' ? 'Bank Details' : (section === 'verification' || section === 'documents') ? (profile.role === 'worker' ? 'Worker Verification' : 'Employer Verification') : section === 'identity' ? 'Identity Checks' : section === 'location' ? 'Location Details' : section === 'admin_message' ? 'Admin Message' : 'Profile';
       if (!body.messageOnly) {
-        // Keep the section approval persisted on the profile row too.
-        // This prevents a re-submitted section from staying visually Pending after admin approval
-        // when activity log rows share close timestamps or the client reloads before logs settle.
         const table = profile.role === 'worker' ? 'workers' : 'employers';
         const sectionKey = normalizeVerifySectionName(section);
-        const result = await persistVerifiedSections(admin, table, userId, [sectionKey], { verification_section: sectionKey, __sectionOnly: true });
-        if (result.error) return err(result.error.message, 400);
-        const stateResult = await upsertVerificationSectionState(admin, userId, profile.role, sectionKey, 'verified', me.id);
-        if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
-        await notify(admin, userId, `${label} verified`, `Admin verified your ${label.toLowerCase()} section.`, 'verification_section', userId);
+        if (approved) {
+          // Keep the section approval persisted on the profile row too.
+          // This prevents a re-submitted section from staying visually Pending after admin approval
+          // when activity log rows share close timestamps or the client reloads before logs settle.
+          const result = await persistVerifiedSections(admin, table, userId, [sectionKey], { verification_section: sectionKey, __sectionOnly: true });
+          if (result.error) return err(result.error.message, 400);
+          const stateResult = await upsertVerificationSectionState(admin, userId, profile.role, sectionKey, 'verified', me.id);
+          if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
+          await notify(admin, userId, `${label} verified`, `Admin verified your ${label.toLowerCase()} section.`, 'verification_section', userId);
+        } else {
+          // Unapprove only the selected card and return it to review. Other approved
+          // cards remain approved, but final account verification must be reopened.
+          const pendingPayload = await buildPendingSectionPayload(admin, table, userId, sectionKey);
+          const result = await upsertRoleProfileCompatible(admin, table, userId, {
+            ...pendingPayload,
+            verified: false,
+            verification_status: 'pending',
+            verification_section: sectionKey,
+            verification_notes: null,
+            verified_at: null,
+          });
+          if (result.error) return err(result.error.message, 400);
+          const stateResult = await upsertVerificationSectionState(admin, userId, profile.role, sectionKey, 'pending', null);
+          if (stateResult.error) return err(`Verification state table error: ${stateResult.error.message}. Run WORK2WISH_VERIFICATION_SECTION_STATE.sql in Supabase.`, 400);
+          await syncConsultantReferralVerification(admin, userId, false);
+          await notify(admin, userId, `${label} review reopened`, `Admin reopened your ${label.toLowerCase()} section for review.`, 'verification_section', userId);
+        }
       }
-      await logActivity(admin, userId, body.messageOnly ? 'admin_sent_message' : 'admin_verified_section', { section, label, message: body.message || null }, me.id);
-      await logActivity(admin, me.id, body.messageOnly ? 'sent_profile_message' : 'verified_profile_section', { user_id: userId, section, role: profile.role }, me.id);
-      return json({ ok: true, section });
+      const userAction = body.messageOnly ? 'admin_sent_message' : approved ? 'admin_verified_section' : 'admin_unapproved_section';
+      const adminAction = body.messageOnly ? 'sent_profile_message' : approved ? 'verified_profile_section' : 'unapproved_profile_section';
+      await logActivity(admin, userId, userAction, { section, label, message: body.message || null }, me.id);
+      await logActivity(admin, me.id, adminAction, { user_id: userId, section, role: profile.role }, me.id);
+      return json({ ok: true, section, approved });
     }
 
     if (path.match(/^admin\/users\/[^/]+\/messages$/) && method === 'GET') {
@@ -1797,6 +2061,8 @@ async function route(request, { params }) {
       await admin.from('notifications').delete().eq('user_id', userId);
       await admin.from('applications').delete().eq('worker_id', userId);
       await admin.from('jobs').delete().eq('employer_id', userId);
+      await admin.from('consultant_referrals').delete().or(`consultant_id.eq.${userId},referred_user_id.eq.${userId}`);
+      await admin.from('consultants').delete().eq('user_id', userId);
       await admin.from('workers').delete().eq('user_id', userId);
       await admin.from('employers').delete().eq('user_id', userId);
       await admin.from('user_profiles').delete().eq('id', userId);
@@ -1831,7 +2097,7 @@ async function route(request, { params }) {
       }
 
       if (role === 'worker') {
-        const wf = ['age', 'gender', 'skills', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known',
+        const wf = ['age', 'gender', 'skills', 'experience_value', 'experience_unit', 'experience_years', 'experience_level', 'expected_daily_wage', 'languages_known',
                     'bank_account', 'account_holder_name', 'bank_name', 'ifsc_code', 'branch_name', 'upi_id', 'bank_qr_url', 'selfie_url', 'selfie_front_url', 'selfie_left_url', 'selfie_right_url', 'selfie_verified', 'selfie_verified_at', 'certificate_url', 'resume_url', 'previous_employer_reference',
                     'location_text', 'latitude', 'longitude', 'place_id', 'place_name', 'bio', 'available', 'address',
                     'aadhaar_number', 'pan_number', 'aadhaar_front_url', 'aadhaar_back_url', 'pan_image_url', 'pan_back_url',
