@@ -72,7 +72,9 @@ function isSubmittedForAdminReview(user) {
     ? ['profile', 'bank', 'documents']
     : role === 'employer'
       ? ['profile', 'documents']
-      : [];
+      : role === 'consultant'
+        ? ['profile', 'bank', 'documents']
+        : [];
   const submittedStates = new Set(['pending', 'submitted', 'verified', 'rejected']);
   const sectionState = (section) => {
     const raw = statuses[section] || (section === 'documents' ? statuses.verification : '');
@@ -1377,7 +1379,7 @@ async function route(request, { params }) {
     if (path === 'consultant/dashboard' && method === 'GET') {
       const { data: profile, error: profileError } = await admin
         .from('user_profiles')
-        .select('id,email,phone,full_name,role,blocked,login_id,created_at')
+        .select('id,email,phone,full_name,photo_url,role,blocked,login_id,created_at,updated_at')
         .eq('id', me.id)
         .maybeSingle();
       if (profileError || !profile) return err('User profile not found', 404);
@@ -1727,23 +1729,82 @@ async function route(request, { params }) {
       // review data becomes available.
       users = users.map((user) => {
         const submittedForReview = isSubmittedForAdminReview(user);
-        if (submittedForReview || user.role === 'admin' || user.role === 'consultant') {
-          return { ...user, submitted_for_review: user.role === 'consultant' ? true : submittedForReview };
+        if (submittedForReview || user.role === 'admin') {
+          return { ...user, submitted_for_review: submittedForReview };
         }
-        return {
+
+        const base = {
           id: user.id,
           email: user.email,
           phone: user.phone || null,
           role: user.role,
           full_name: user.full_name,
+          photo_url: user.photo_url || null,
           login_id: user.login_id,
           blocked: !!user.blocked,
           verified: !!user.verified,
           verification_status: 'not_submitted',
+          section_statuses: user.section_statuses || {},
+          verification_section_rows: user.verification_section_rows || [],
           created_at: user.created_at,
           updated_at: user.updated_at,
           submitted_for_review: false,
         };
+
+        // Before Send for Verification, Admin may see only the basic Profile card.
+        // Bank details and verification documents remain hidden until the complete
+        // role-specific verification set has been submitted.
+        if (user.role === 'worker') {
+          return {
+            ...base,
+            age: user.age,
+            gender: user.gender,
+            address: user.address,
+            skills: user.skills,
+            experience_value: user.experience_value,
+            experience_years: user.experience_years,
+            experience_unit: user.experience_unit,
+            experience_level: user.experience_level,
+            expected_daily_wage: user.expected_daily_wage,
+            languages_known: user.languages_known,
+            available: user.available,
+            previous_employer_reference: user.previous_employer_reference,
+            bio: user.bio,
+            location_text: user.location_text,
+            place_name: user.place_name,
+            latitude: user.latitude,
+            longitude: user.longitude,
+            resume_url: user.resume_url,
+          };
+        }
+        if (user.role === 'employer') {
+          return {
+            ...base,
+            company_name: user.company_name,
+            company_logo: user.company_logo,
+            industry: user.industry,
+            company_size: user.company_size,
+            hr_contact: user.hr_contact,
+            official_email: user.official_email,
+            company_address: user.company_address,
+            description: user.description,
+            location_text: user.location_text,
+            place_name: user.place_name,
+            latitude: user.latitude,
+            longitude: user.longitude,
+          };
+        }
+        if (user.role === 'consultant') {
+          return {
+            ...base,
+            address: user.address,
+            referral_code: user.referral_code,
+            total_referrals: user.total_referrals || 0,
+            verified_referrals: user.verified_referrals || 0,
+            points: user.points || 0,
+          };
+        }
+        return base;
       });
 
       // Preserve the endpoint's existing query/filter contract for any caller
@@ -1781,7 +1842,7 @@ async function route(request, { params }) {
       const userId = path.split('/')[2];
       const user = await getUserAdminDetail(userId);
       if (!user) return err('User not found', 404);
-      if (user.role !== 'consultant' && !isSubmittedForAdminReview(user)) return err('Profile has not been submitted for verification', 404);
+      if (user.role !== 'admin' && !isSubmittedForAdminReview(user)) return err('Profile has not been submitted for verification', 404);
       let jobs = [], applications = [], activity = [];
       try {
         if (user.role === 'employer') {
@@ -1800,6 +1861,96 @@ async function route(request, { params }) {
       return json({ user: { ...user, jobs, applications, activity, submitted_for_review: true } });
     }
 
+    if (path.match(/^admin\/users\/[^/]+\/profile$/) && method === 'PATCH') {
+      const check = await requireAdmin();
+      if (check.error) return err(check.error, check.status);
+      const userId = path.split('/')[2];
+      const body = await request.json().catch(() => ({}));
+      const { data: target } = await admin
+        .from('user_profiles')
+        .select('id,role,email,full_name,phone')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!target) return err('User not found', 404);
+      if (!['worker', 'employer'].includes(target.role)) return err('Only Worker and Employer profile sections can be edited here', 400);
+
+      const profileUpdate = {};
+      if ('full_name' in body) profileUpdate.full_name = String(body.full_name || '').trim();
+      if ('phone' in body) {
+        const rawPhone = String(body.phone || '').trim();
+        const phoneDigits = rawPhone.replace(/\D/g, '');
+        if (rawPhone && !(phoneDigits.length === 10 || (phoneDigits.length >= 11 && phoneDigits.length <= 15))) {
+          return err('Enter a valid mobile number', 400);
+        }
+        profileUpdate.phone = rawPhone ? normalizePhone(rawPhone) : null;
+      }
+      if (Object.keys(profileUpdate).length) {
+        profileUpdate.updated_at = new Date().toISOString();
+        const { error: profileError } = await admin.from('user_profiles').update(profileUpdate).eq('id', userId);
+        if (profileError) return err(profileError.message, 400);
+      }
+
+      const toTextArray = (value) => {
+        if (Array.isArray(value)) return value.map((item) => String(item || '').trim()).filter(Boolean);
+        return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+      };
+      const toNullableNumber = (value) => {
+        if (value === '' || value === null || value === undefined) return null;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      };
+
+      if (target.role === 'worker') {
+        const workerFields = [
+          'age', 'gender', 'address', 'experience_level',
+          'previous_employer_reference', 'bio', 'available',
+        ];
+        const workerUpdate = {};
+        for (const key of workerFields) if (key in body) workerUpdate[key] = body[key];
+
+        if ('skills' in body) workerUpdate.skills = toTextArray(body.skills);
+        if ('languages_known' in body) workerUpdate.languages_known = toTextArray(body.languages_known);
+        if ('experience_unit' in body) workerUpdate.experience_unit = body.experience_unit === 'months' ? 'months' : 'years';
+        if ('experience_value' in body) {
+          const value = toNullableNumber(body.experience_value);
+          workerUpdate.experience_value = value ?? 0;
+          const unit = (body.experience_unit || workerUpdate.experience_unit) === 'months' ? 'months' : 'years';
+          workerUpdate.experience_years = unit === 'months'
+            ? Math.max(0, Math.floor(Number(value || 0) / 12))
+            : Math.max(0, Math.floor(Number(value || 0)));
+        }
+        if ('expected_daily_wage' in body) workerUpdate.expected_daily_wage = toNullableNumber(body.expected_daily_wage) ?? 0;
+        if ('age' in body) workerUpdate.age = toNullableNumber(body.age);
+        if ('available' in body) {
+          workerUpdate.available = !!body.available;
+          workerUpdate.badge_immediate_joiner = !!body.available;
+        }
+
+        if (Object.keys(workerUpdate).length) {
+          const result = await upsertRoleProfileCompatible(admin, 'workers', userId, workerUpdate);
+          if (result.error) return err(result.error.message, 400);
+        }
+      } else {
+        const employerFields = [
+          'company_name', 'industry', 'company_size', 'hr_contact', 'official_email',
+          'company_address', 'description',
+        ];
+        const employerUpdate = {};
+        for (const key of employerFields) if (key in body) employerUpdate[key] = body[key];
+        if (Object.keys(employerUpdate).length) {
+          const result = await upsertRoleProfileCompatible(admin, 'employers', userId, employerUpdate);
+          if (result.error) return err(result.error.message, 400);
+        }
+      }
+
+      await logActivity(admin, userId, 'admin_updated_profile_details', { role: target.role, fields: Object.keys(body) }, me.id);
+      await logActivity(admin, me.id, 'updated_user_profile_details', { user_id: userId, role: target.role, fields: Object.keys(body) }, me.id);
+
+      const user = await getUserAdminDetail(userId);
+      return json({ ok: true, user });
+    }
+
+
     if (path.match(/^admin\/users\/[^/]+\/verify$/) && method === 'PATCH') {
       const check = await requireAdmin();
       if (check.error) return err(check.error, check.status);
@@ -1810,8 +1961,8 @@ async function route(request, { params }) {
       const badges = body.badges || {};
       const { data: profile } = await admin.from('user_profiles').select('role').eq('id', userId).maybeSingle();
       if (!profile) return err('User not found', 404);
-      if (!['worker', 'employer'].includes(profile.role)) return err('Only worker/employer accounts can be verified', 400);
-      const table = profile.role === 'worker' ? 'workers' : 'employers';
+      if (!['worker', 'employer', 'consultant'].includes(profile.role)) return err('This account type cannot be verified here', 400);
+      const table = profile.role === 'worker' ? 'workers' : profile.role === 'employer' ? 'employers' : 'consultants';
       const updatePayload = {
         verified,
         verification_status: verified ? 'verified' : 'rejected',
@@ -1830,7 +1981,9 @@ async function route(request, { params }) {
       if (verified) {
         const sectionsToVerify = profile.role === 'worker'
           ? ['profile', 'documents', 'bank']
-          : ['profile', 'documents'];
+          : profile.role === 'consultant'
+            ? ['profile', 'documents', 'bank']
+            : ['profile', 'documents'];
         const result = await persistVerifiedSections(admin, table, userId, sectionsToVerify, updatePayload);
         error = result.error;
         if (!error) {
@@ -1874,10 +2027,20 @@ async function route(request, { params }) {
       const { data: profile } = await admin.from('user_profiles').select('role,email,full_name').eq('id', userId).maybeSingle();
       if (!profile) return err('User not found', 404);
       if (profile.role === 'admin') return err('Admin profile cannot be verified here', 400);
-      if (!body.messageOnly && !['worker', 'employer'].includes(profile.role)) return err('This account type does not use document verification', 400);
-      const label = section === 'bank' ? 'Bank Details' : (section === 'verification' || section === 'documents') ? (profile.role === 'worker' ? 'Worker Verification' : 'Employer Verification') : section === 'identity' ? 'Identity Checks' : section === 'location' ? 'Location Details' : section === 'admin_message' ? 'Admin Message' : 'Profile';
+      if (!body.messageOnly && !['worker', 'employer', 'consultant'].includes(profile.role)) return err('This account type does not use document verification', 400);
+      const label = section === 'bank'
+        ? 'Bank Details'
+        : (section === 'verification' || section === 'documents')
+          ? (profile.role === 'worker' ? 'Worker Verification' : profile.role === 'consultant' ? 'Consultant Verification' : 'Employer Verification')
+          : section === 'identity'
+            ? 'Identity Checks'
+            : section === 'location'
+              ? 'Location Details'
+              : section === 'admin_message'
+                ? 'Admin Message'
+                : 'Profile';
       if (!body.messageOnly) {
-        const table = profile.role === 'worker' ? 'workers' : 'employers';
+        const table = profile.role === 'worker' ? 'workers' : profile.role === 'employer' ? 'employers' : 'consultants';
         const sectionKey = normalizeVerifySectionName(section);
         if (approved) {
           // Keep the section approval persisted on the profile row too.
@@ -1968,6 +2131,9 @@ async function route(request, { params }) {
         extra = data;
       } else if (profile?.role === 'employer') {
         const { data } = await admin.from('employers').select('*').eq('user_id', me.id).maybeSingle();
+        extra = data;
+      } else if (profile?.role === 'consultant') {
+        const { data } = await admin.from('consultants').select('*').eq('user_id', me.id).maybeSingle();
         extra = data;
       }
 
@@ -2156,6 +2322,47 @@ async function route(request, { params }) {
           if (result.error) return err(result.error.message, 400);
           updatedExtra = result.data;
         }
+      } else if (role === 'consultant') {
+        const cf = [
+          'address',
+          'account_holder_name',
+          'bank_name',
+          'bank_account',
+          'ifsc_code',
+          'branch_name',
+          'upi_id',
+          'bank_qr_url',
+          'pan_number',
+          'pan_image_url',
+          'aadhaar_number',
+          'aadhaar_front_url',
+          'aadhaar_back_url',
+          'verification_status',
+          'verification_section',
+          'verification_notes',
+        ];
+        const cu = {};
+        for (const k of cf) if (k in body) cu[k] = body[k];
+
+        if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
+          const pendingSection = normalizeVerifySectionName(body.verification_section || 'profile');
+          Object.assign(cu, await buildPendingSectionPayload(admin, 'consultants', me.id, pendingSection));
+          cu.verified = false;
+          cu.verification_status = 'pending';
+          cu.verification_section = pendingSection;
+          cu.verification_notes = null;
+          cu.verification_submitted_at = new Date().toISOString();
+        }
+
+        if (Object.keys(cu).length) {
+          cu.updated_at = new Date().toISOString();
+          const result = await upsertRoleProfileCompatible(admin, 'consultants', me.id, cu);
+          if (result.error) return err(result.error.message, 400);
+          updatedExtra = result.data;
+        } else {
+          const { data } = await admin.from('consultants').select('*').eq('user_id', me.id).maybeSingle();
+          updatedExtra = data;
+        }
       }
 
       if (body.verification_status === 'submitted' || body.verification_status === 'pending') {
@@ -2163,7 +2370,11 @@ async function route(request, { params }) {
         // been submitted. This keeps incomplete/draft profiles out of the Admin
         // workflow and prevents partial-profile review notifications.
         const durable = await readVerificationSectionStates(admin, me.id);
-        const requiredSections = role === 'worker' ? ['profile', 'bank', 'documents'] : ['profile', 'documents'];
+        const requiredSections = role === 'worker'
+          ? ['profile', 'bank', 'documents']
+          : role === 'consultant'
+            ? ['profile', 'bank', 'documents']
+            : ['profile', 'documents'];
         const submittedStates = new Set(['pending', 'submitted', 'verified', 'rejected']);
         const readyForAdmin = requiredSections.every((section) => submittedStates.has(String(durable.statuses?.[section] || '').toLowerCase()));
 

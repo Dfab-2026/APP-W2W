@@ -1,0 +1,26 @@
+WORK2WISH CONSULTANT PROFILE + ADMIN VERIFICATION SETUP
+========================================================
+
+REQUIRED DATABASE STEP
+----------------------
+1. Extract/deploy this updated project.
+2. Open Supabase -> SQL Editor -> New query.
+3. Open CONSULTANT_VERIFICATION_FLOW_UPDATE.sql from this project.
+4. Copy the complete SQL, paste it into Supabase, and click Run.
+5. Run it once. It is safe to re-run because schema additions use IF NOT EXISTS.
+
+WHAT THIS VERSION DOES
+----------------------
+- Admin can see the basic Profile card for Worker, Employer, and Consultant even before Send for Verification.
+- Bank details and verification documents stay hidden until the complete role-specific verification set is submitted.
+- Consultant now uses the same card lifecycle as the other roles:
+  Profile -> Send for Verification -> Admin Approve
+  Bank Details -> Send for Verification -> Admin Approve
+  Consultant Verification -> Send for Verification -> Admin Approve
+  Then Admin performs Final Verify Account.
+- Consultant has a normal full Profile page UI, while retaining the intentionally minimal Consultant fields requested earlier.
+- Consultant referral dashboard, referral link and point system remain unchanged.
+- Consultant role badge in the Admin queue is fuchsia/magenta so it is distinct from Worker blue, Employer green, and Admin amber.
+- Worker/Employer/Admin flows are otherwise unchanged.
+
+No new environment variables are required.

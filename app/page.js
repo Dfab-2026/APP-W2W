@@ -1523,6 +1523,25 @@ function ConsultantApp({ auth, onLogout }) {
   const userId = auth?.profile?.id || auth?.session?.user?.id;
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [view, setView] = useState('dashboard');
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [consultantForm, setConsultantForm] = useState({
+    full_name: '',
+    phone: '',
+    address: '',
+    account_holder_name: '',
+    bank_name: '',
+    bank_account: '',
+    ifsc_code: '',
+    branch_name: '',
+    upi_id: '',
+    bank_qr_url: '',
+    pan_number: '',
+    pan_image_url: '',
+    aadhaar_number: '',
+    aadhaar_front_url: '',
+    aadhaar_back_url: '',
+  });
 
   const loadDashboard = useCallback(async ({ silent = false } = {}) => {
     if (!token) return;
@@ -1538,6 +1557,29 @@ function ConsultantApp({ auth, onLogout }) {
   }, [token]);
 
   useEffect(() => { loadDashboard(); }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!dashboard) return;
+    const p = dashboard.profile || {};
+    const c = dashboard.consultant || {};
+    setConsultantForm({
+      full_name: p.full_name || '',
+      phone: p.phone || '',
+      address: c.address || '',
+      account_holder_name: c.account_holder_name || '',
+      bank_name: c.bank_name || '',
+      bank_account: c.bank_account || '',
+      ifsc_code: c.ifsc_code || '',
+      branch_name: c.branch_name || '',
+      upi_id: c.upi_id || '',
+      bank_qr_url: c.bank_qr_url || '',
+      pan_number: c.pan_number || '',
+      pan_image_url: c.pan_image_url || '',
+      aadhaar_number: c.aadhaar_number || '',
+      aadhaar_front_url: c.aadhaar_front_url || '',
+      aadhaar_back_url: c.aadhaar_back_url || '',
+    });
+  }, [dashboard]);
 
   useEffect(() => {
     if (!token || typeof window === 'undefined') return undefined;
@@ -1558,6 +1600,35 @@ function ConsultantApp({ auth, onLogout }) {
     if (!dashboard?.referral_code || typeof window === 'undefined') return '';
     return `${window.location.origin}/?ref=${encodeURIComponent(dashboard.referral_code)}`;
   }, [dashboard?.referral_code]);
+
+  const consultantMe = useMemo(() => ({
+    profile: dashboard?.profile || {},
+    extra: dashboard?.consultant || {},
+    section_statuses: dashboard?.consultant?.section_statuses || {},
+    verification_status: dashboard?.consultant?.verification_status || '',
+  }), [dashboard]);
+
+  const updateConsultantSectionStatus = useCallback((section, status) => {
+    const normalized = normalizeVerifySectionName(section);
+    setDashboard((current) => {
+      if (!current) return current;
+      const currentConsultant = current.consultant || {};
+      const statuses = {
+        ...(currentConsultant.section_statuses || {}),
+        [normalized]: status,
+        ...(normalized === 'documents' ? { verification: status } : {}),
+      };
+      return {
+        ...current,
+        consultant: {
+          ...currentConsultant,
+          section_statuses: statuses,
+          verification_status: status === 'pending' ? 'pending' : currentConsultant.verification_status,
+          verification_section: normalized,
+        },
+      };
+    });
+  }, []);
 
   const copyReferralLink = async () => {
     if (!referralLink) return;
@@ -1583,85 +1654,414 @@ function ConsultantApp({ auth, onLogout }) {
   };
 
   return (
-    <div className="h-[100dvh] overflow-y-auto overflow-x-hidden bg-gradient-to-br from-slate-50 via-violet-50/50 to-amber-50/40 text-slate-950">
-      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur shadow-sm">
-        <div className="container py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <Work2WishLogo className="w-11 h-11" />
-            <div>
-              <p className="text-xs font-bold uppercase tracking-[0.16em] text-violet-600">Work2Wish Consultant</p>
-              <h1 className="text-2xl font-extrabold">Consultant Dashboard</h1>
+    <div className="w2w-dashboard-shell h-[100dvh] max-h-[100dvh] bg-slate-50 overflow-hidden flex flex-col">
+      <header className="bg-gradient-to-r from-[#04112f] via-[#071f55] to-[#0b3b91] backdrop-blur-xl border-b border-blue-400/20 shrink-0 z-10 shadow-[0_10px_34px_rgba(7,31,85,0.30)]">
+        <div className="container py-2.5 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <motion.div
+              className="w-11 h-11 rounded-xl bg-white grid place-items-center shadow-lg shadow-blue-950/30 ring-2 ring-sky-300/40 p-1"
+              whileHover={{ scale: 1.05 }}
+              transition={{ duration: 0.5 }}
+            >
+              <Work2WishLogo className="w-full h-full" />
+            </motion.div>
+            <div className="leading-tight">
+              <p className="font-extrabold text-white tracking-tight">{dashboard?.profile?.full_name || 'Consultant'}</p>
+              <p className="text-[10px] text-sky-100/80">Consultant portal</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
             <NotificationCenter token={token} userId={userId} channelKey="consultant" accent="amber" />
-            <Button variant="outline" onClick={() => loadDashboard()} disabled={loading}>{loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Refresh'}</Button>
-            <Button onClick={onLogout} className="bg-slate-900 hover:bg-slate-800 text-white"><LogOut className="w-4 h-4 mr-2" />Logout</Button>
+            {view === 'profile' ? (
+              <Button type="button" variant="ghost" className="rounded-xl text-sky-100 hover:bg-white/10 hover:text-white" onClick={() => setView('dashboard')}>
+                <ArrowLeft className="w-4 h-4 mr-2" /> Dashboard
+              </Button>
+            ) : (
+              <Button type="button" variant="ghost" size="icon" className="rounded-xl text-sky-100 hover:bg-white/10 hover:text-white" onClick={() => setView('profile')} title="Profile">
+                <UserCircle className="w-5 h-5" />
+              </Button>
+            )}
+            <Button type="button" variant="ghost" size="icon" onClick={() => loadDashboard()} disabled={loading} className="rounded-xl text-sky-100 hover:bg-white/10 hover:text-white" title="Refresh">
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshIcon />}
+            </Button>
+            <Button type="button" variant="ghost" size="icon" onClick={onLogout} className="rounded-xl text-sky-100 hover:bg-white/10 hover:text-white" title="Logout">
+              <LogOut className="w-5 h-5" />
+            </Button>
           </div>
         </div>
       </header>
 
-      <main className="container py-6 pb-24 space-y-5">
-        <div className="grid sm:grid-cols-3 gap-4">
-          <Card className="border-violet-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">People from your link</p><p className="mt-2 text-3xl font-black text-violet-700">{dashboard?.total_referrals || 0}</p><p className="mt-1 text-xs text-slate-500">{dashboard?.total_login_events || 0} tracked link login{Number(dashboard?.total_login_events || 0) === 1 ? '' : 's'}</p></CardContent></Card>
-          <Card className="border-emerald-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Admin verified referrals</p><p className="mt-2 text-3xl font-black text-emerald-700">{dashboard?.verified_referrals || 0}</p></CardContent></Card>
-          <Card className="border-amber-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Points</p><p className="mt-2 text-3xl font-black text-amber-700">{dashboard?.points || 0}</p><p className="mt-1 text-xs text-slate-500">1 point for each referred person verified by Admin.</p></CardContent></Card>
-        </div>
-
-        <Card className="border-violet-200 bg-white shadow-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Copy className="w-5 h-5 text-violet-700" />Your unique consultant link</CardTitle>
-            <CardDescription>Share this link. A Worker or Employer who logs in through it is attached to your consultant account.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="flex flex-col sm:flex-row gap-2">
-              <Input value={referralLink} readOnly className="font-mono text-sm bg-slate-50" />
-              <Button type="button" onClick={copyReferralLink} className="bg-violet-600 hover:bg-violet-700"><Copy className="w-4 h-4 mr-2" />Copy Link</Button>
-              <Button type="button" variant="outline" onClick={shareReferralLink}><Send className="w-4 h-4 mr-2" />Share</Button>
+      <main className="container flex-1 min-h-0 overflow-y-auto py-4 pb-8">
+        {view === 'profile' ? (
+          <ConsultantProfile
+            token={token}
+            dashboard={dashboard}
+            me={consultantMe}
+            form={consultantForm}
+            setForm={setConsultantForm}
+            busy={profileBusy}
+            setBusy={setProfileBusy}
+            onSaved={() => loadDashboard({ silent: true })}
+            onStatusChange={updateConsultantSectionStatus}
+          />
+        ) : (
+          <div className="space-y-5">
+            <div className="grid sm:grid-cols-3 gap-4">
+              <Card className="border-violet-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">People from your link</p><p className="mt-2 text-3xl font-black text-violet-700">{dashboard?.total_referrals || 0}</p><p className="mt-1 text-xs text-slate-500">{dashboard?.total_login_events || 0} tracked link login{Number(dashboard?.total_login_events || 0) === 1 ? '' : 's'}</p></CardContent></Card>
+              <Card className="border-emerald-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Admin verified referrals</p><p className="mt-2 text-3xl font-black text-emerald-700">{dashboard?.verified_referrals || 0}</p></CardContent></Card>
+              <Card className="border-amber-200 bg-white shadow-sm"><CardContent className="p-5"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Points</p><p className="mt-2 text-3xl font-black text-amber-700">{dashboard?.points || 0}</p><p className="mt-1 text-xs text-slate-500">1 point for each referred person verified by Admin.</p></CardContent></Card>
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
-              <Badge className="bg-violet-100 text-violet-800 border border-violet-200">Code: {dashboard?.referral_code || '—'}</Badge>
-              <span>Referral credit is counted once per Work2Wish account.</span>
-            </div>
-          </CardContent>
-        </Card>
 
-        <Card className="border-slate-200 bg-white shadow-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Users className="w-5 h-5 text-violet-700" />People from your link</CardTitle>
-            <CardDescription>Verified people receive a badge here and add one point to your total.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {loading && !dashboard ? (
-              <div className="py-12 text-center text-slate-500"><Loader2 className="w-5 h-5 animate-spin inline mr-2" />Loading referrals…</div>
-            ) : (dashboard?.referrals || []).length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-10 text-center">
-                <Users className="w-9 h-9 mx-auto text-slate-400" />
-                <p className="mt-3 font-semibold">No referred logins yet</p>
-                <p className="mt-1 text-sm text-slate-500">Share your consultant link to start tracking people.</p>
-              </div>
-            ) : (
-              <div className="overflow-x-auto rounded-2xl border border-slate-200">
-                <table className="w-full min-w-[760px] text-sm">
-                  <thead className="bg-slate-50 text-slate-600"><tr><th className="p-3 text-left">Person</th><th className="p-3 text-left">Role</th><th className="p-3 text-left">Joined through link</th><th className="p-3 text-left">Link logins</th><th className="p-3 text-left">Status</th><th className="p-3 text-right">Points</th></tr></thead>
-                  <tbody>
-                    {(dashboard?.referrals || []).map((item) => (
-                      <tr key={item.id} className="border-t border-slate-100">
-                        <td className="p-3"><p className="font-semibold text-slate-900">{item.full_name || 'Work2Wish user'}</p><p className="text-xs text-slate-500">{item.email || '—'}</p></td>
-                        <td className="p-3 capitalize">{item.role || '—'}</td>
-                        <td className="p-3">{item.registered_at ? new Date(item.registered_at).toLocaleString() : '—'}</td>
-                        <td className="p-3 font-semibold text-slate-700">{item.login_count || 1}</td>
-                        <td className="p-3">{item.points_awarded || item.status === 'verified' ? <Badge className="bg-emerald-100 text-emerald-800 border border-emerald-200"><CheckCircle2 className="w-3.5 h-3.5 mr-1" />Admin Verified</Badge> : <Badge variant="outline" className="text-amber-700 border-amber-200 bg-amber-50">Awaiting verification</Badge>}</td>
-                        <td className="p-3 text-right font-bold text-amber-700">{item.points_awarded ? '+1' : '0'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+            <Card className="border-violet-200 bg-white shadow-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Copy className="w-5 h-5 text-violet-700" />Your unique consultant link</CardTitle>
+                <CardDescription>Share this link. A Worker or Employer who logs in through it is attached to your consultant account.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <Input value={referralLink} readOnly className="font-mono text-sm bg-slate-50" />
+                  <Button type="button" onClick={copyReferralLink} className="bg-violet-600 hover:bg-violet-700"><Copy className="w-4 h-4 mr-2" />Copy Link</Button>
+                  <Button type="button" variant="outline" onClick={shareReferralLink}><Send className="w-4 h-4 mr-2" />Share</Button>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
+                  <Badge className="bg-violet-100 text-violet-800 border border-violet-200">Code: {dashboard?.referral_code || '—'}</Badge>
+                  <span>Referral credit is counted once per Work2Wish account.</span>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="border-slate-200 bg-white shadow-sm">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2"><Users className="w-5 h-5 text-violet-700" />People from your link</CardTitle>
+                <CardDescription>Verified people receive a badge here and add one point to your total.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {loading && !dashboard ? (
+                  <div className="py-12 text-center text-slate-500"><Loader2 className="w-5 h-5 animate-spin inline mr-2" />Loading referrals…</div>
+                ) : (dashboard?.referrals || []).length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-10 text-center">
+                    <Users className="w-9 h-9 mx-auto text-slate-400" />
+                    <p className="mt-3 font-semibold">No referred logins yet</p>
+                    <p className="mt-1 text-sm text-slate-500">Share your consultant link to start tracking people.</p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-2xl border border-slate-200">
+                    <table className="w-full min-w-[760px] text-sm">
+                      <thead className="bg-slate-50 text-slate-600"><tr><th className="p-3 text-left">Person</th><th className="p-3 text-left">Role</th><th className="p-3 text-left">Joined through link</th><th className="p-3 text-left">Link logins</th><th className="p-3 text-left">Status</th><th className="p-3 text-right">Points</th></tr></thead>
+                      <tbody>
+                        {(dashboard?.referrals || []).map((item) => (
+                          <tr key={item.id} className="border-t border-slate-100">
+                            <td className="p-3"><p className="font-semibold text-slate-900">{item.full_name || 'Work2Wish user'}</p><p className="text-xs text-slate-500">{item.email || '—'}</p></td>
+                            <td className="p-3 capitalize">{item.role || '—'}</td>
+                            <td className="p-3">{item.registered_at ? new Date(item.registered_at).toLocaleString() : '—'}</td>
+                            <td className="p-3 font-semibold text-slate-700">{item.login_count || 1}</td>
+                            <td className="p-3">{item.points_awarded || item.status === 'verified' ? <Badge className="bg-emerald-100 text-emerald-800 border border-emerald-200"><CheckCircle2 className="w-3.5 h-3.5 mr-1" />Admin Verified</Badge> : <Badge variant="outline" className="text-amber-700 border-amber-200 bg-amber-50">Awaiting verification</Badge>}</td>
+                            <td className="p-3 text-right font-bold text-amber-700">{item.points_awarded ? '+1' : '0'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        )}
       </main>
+    </div>
+  );
+}
+
+function RefreshIcon() {
+  return <Clock className="w-4 h-4" />;
+}
+
+function ConsultantProfile({ token, dashboard, me, form, setForm, busy, setBusy, onSaved, onStatusChange }) {
+  const consultant = dashboard?.consultant || {};
+  const profile = dashboard?.profile || {};
+  const profileStatus = sectionReviewState(me, 'profile', consultant.verification_status, !!consultant.verified);
+  const bankStatus = sectionReviewState(me, 'bank', consultant.verification_status, !!consultant.verified);
+  const documentsStatus = sectionReviewState(me, 'documents', consultant.verification_status, !!consultant.verified);
+  const anyPending = [profileStatus, bankStatus, documentsStatus].includes('pending');
+  const allSectionsVerified = [profileStatus, bankStatus, documentsStatus].every((status) => status === 'verified');
+
+  const consultantProfileChanged = (profileStatus === 'pending' || profileStatus === 'verified') && hasVerifySectionChanged(
+    ['full_name', 'phone', 'address'],
+    form,
+    profile,
+    consultant
+  );
+  const consultantBankChanged = (bankStatus === 'pending' || bankStatus === 'verified') && hasVerifySectionChanged(
+    ['account_holder_name', 'bank_name', 'bank_account', 'ifsc_code', 'branch_name', 'upi_id', 'bank_qr_url'],
+    form,
+    profile,
+    consultant
+  );
+  const consultantDocumentsChanged = (documentsStatus === 'pending' || documentsStatus === 'verified') && hasVerifySectionChanged(
+    ['pan_number', 'pan_image_url', 'aadhaar_number', 'aadhaar_front_url', 'aadhaar_back_url'],
+    form,
+    profile,
+    consultant
+  );
+
+  const cleanAadhaar = (value) => String(value || '').replace(/\D/g, '').slice(0, 12);
+  const cleanPan = (value) => String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+  const validPan = (value) => /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(String(value || ''));
+  const validAadhaar = (value) => /^\d{12}$/.test(String(value || ''));
+
+  const uploadField = async (field, kind, file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const { url } = await uploadFile(file, kind, token);
+      setForm((current) => ({ ...current, [field]: url }));
+      toast.success('File selected. Click Send for Verification to submit this section.');
+    } catch (e) {
+      toast.error(e.message || 'Upload failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadBankQr = async (file) => {
+    if (!file) return;
+    setBusy(true);
+    try {
+      const { url } = await uploadFile(file, 'consultant-bank-qr', token);
+      setForm((current) => ({ ...current, bank_qr_url: url }));
+      toast.success('QR selected. Click Send for Verification to submit bank details.');
+    } catch (e) {
+      toast.error(e.message || 'QR upload failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!dashboard) {
+    return <div className="py-16 grid place-items-center"><Loader2 className="w-6 h-6 animate-spin text-slate-400" /></div>;
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card className="profile-section-card overflow-hidden">
+        <CardContent className="p-5 flex items-center gap-4">
+          <AvatarUploader
+            token={token}
+            currentUrl={profile.photo_url}
+            kind="avatar"
+            color="indigo"
+            onUploaded={() => onSaved?.()}
+          />
+          <div className="flex-1 min-w-0">
+            <p className="font-bold text-lg">{profile.full_name || 'Consultant'}</p>
+            <p className="text-sm text-muted-foreground truncate">{profile.email}</p>
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              {consultant.verified ? (
+                <Badge className="border border-emerald-600 bg-emerald-600 text-white shadow-sm"><CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Verified</Badge>
+              ) : anyPending || allSectionsVerified ? (
+                <Badge className="border border-amber-200 bg-amber-50 text-amber-700 shadow-sm"><Clock className="w-3.5 h-3.5 mr-1" /> Pending Approval</Badge>
+              ) : (
+                <Badge className="border border-rose-200 bg-rose-50 text-rose-700 shadow-sm"><ShieldCheck className="w-3.5 h-3.5 mr-1" /> Send for Verification</Badge>
+              )}
+            </div>
+            {profile.login_id && (
+              <button
+                type="button"
+                onClick={() => { navigator.clipboard?.writeText(profile.login_id); toast.success('Login ID copied'); }}
+                className="mt-2 inline-flex items-center gap-1.5 text-xs bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-full hover:bg-indigo-100"
+              >
+                <Hash className="w-3 h-3" /> ID: <span className="font-bold tracking-wider">{profile.login_id}</span><Copy className="w-3 h-3 opacity-60" />
+              </button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="profile-section-card overflow-hidden">
+        <CardHeader className="profile-section-header">
+          <div>
+            <CardTitle className="text-base flex items-center gap-2"><UserCircle className="w-4 h-4 text-indigo-600" /> Profile details</CardTitle>
+            <CardDescription>Basic consultant information for Admin verification.</CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent className="grid sm:grid-cols-2 gap-3">
+          <Field label="Full name" v={form.full_name} on={(v) => setForm((f) => ({ ...f, full_name: v }))} />
+          <Field label="Phone" v={cleanIndianPhone10(form.phone)} on={(v) => setForm((f) => ({ ...f, phone: cleanIndianPhone10(v) }))} inputMode="numeric" maxLength={10} prefix="+91" helper="Enter 10-digit Indian mobile number" />
+          <div className="sm:col-span-2">
+            <Label>Address<span className="text-red-500 ml-0.5">*</span></Label>
+            <Textarea rows={3} value={form.address || ''} onChange={(e) => setForm((f) => ({ ...f, address: e.target.value }))} placeholder="Door no, street, area, city, state, pincode" />
+          </div>
+          <div className="sm:col-span-2">
+            <SectionVerificationAction
+              token={token}
+              me={me}
+              section="profile"
+              title="Admin approval required"
+              description="Admin checks your basic consultant profile and marks this card approved."
+              color="indigo"
+              setForm={setForm}
+              onSaved={onSaved}
+              onStatusChange={onStatusChange}
+              disabled={!String(form.full_name || '').trim() || !String(form.phone || '').trim() || !String(form.address || '').trim()}
+              validate={() => {
+                if (!String(form.full_name || '').trim()) return 'Enter full name';
+                if (!isValidIndianPhone10(form.phone)) return 'Enter valid 10-digit Indian mobile number';
+                if (!String(form.address || '').trim()) return 'Enter address';
+                return '';
+              }}
+              payloadBuilder={() => ({
+                full_name: String(form.full_name || '').trim(),
+                phone: cleanIndianPhone10(form.phone),
+                address: String(form.address || '').trim(),
+              })}
+              modified={consultantProfileChanged}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="profile-section-card overflow-hidden">
+        <CardHeader className="profile-section-header">
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+            <div>
+              <CardTitle className="text-base flex items-center gap-2"><Banknote className="w-4 h-4 text-emerald-600" /> Bank details</CardTitle>
+              <CardDescription>Consultant payout details reviewed by Admin.</CardDescription>
+            </div>
+            <label className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 text-sm font-semibold text-emerald-700 cursor-pointer hover:bg-emerald-100">
+              <Upload className="w-4 h-4" /> QR upload <span className="text-[10px] font-normal opacity-70">optional</span>
+              <input type="file" accept="image/*" className="hidden" disabled={busy} onChange={(e) => { const file = e.target.files?.[0]; if (file) uploadBankQr(file); e.target.value = ''; }} />
+            </label>
+          </div>
+        </CardHeader>
+        <CardContent className="p-4 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 items-stretch rounded-3xl border border-slate-200 bg-white p-3 shadow-sm">
+            <Field label="Account holder name" v={form.account_holder_name} on={(v) => setForm((f) => ({ ...f, account_holder_name: v }))} />
+            <Field label="Bank name" v={form.bank_name} on={(v) => setForm((f) => ({ ...f, bank_name: v }))} />
+            <Field label="Account number" v={form.bank_account} on={(v) => setForm((f) => ({ ...f, bank_account: cleanBankAccount(v) }))} inputMode="numeric" maxLength={18} helper="9 to 18 digits only" />
+            <Field label="IFSC code" v={form.ifsc_code} on={(v) => setForm((f) => ({ ...f, ifsc_code: cleanIfscCode(v) }))} maxLength={11} helper="Format: ABCD0123456" />
+            <Field label="Branch name" v={form.branch_name} on={(v) => setForm((f) => ({ ...f, branch_name: v }))} />
+            <Field label="UPI ID" v={form.upi_id} on={(v) => setForm((f) => ({ ...f, upi_id: v }))} required={false} />
+          </div>
+          {form.bank_qr_url && (
+            <div className="flex items-center justify-between rounded-2xl border border-emerald-100 bg-emerald-50/70 p-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-12 h-12 rounded-xl border bg-white overflow-hidden grid place-items-center shrink-0"><img src={form.bank_qr_url} alt="UPI QR" className="w-full h-full object-cover" /></div>
+                <div className="min-w-0"><p className="text-sm font-semibold">UPI QR uploaded</p><p className="text-xs text-muted-foreground truncate">Optional QR code for payout verification.</p></div>
+              </div>
+              <Button type="button" size="sm" variant="outline" className="border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100" onClick={() => setForm((f) => ({ ...f, bank_qr_url: '' }))}>Remove</Button>
+            </div>
+          )}
+          <SectionVerificationAction
+            token={token}
+            me={me}
+            section="bank"
+            title="Admin approval required"
+            description="Admin checks your bank details and marks this card approved."
+            color="emerald"
+            setForm={setForm}
+            onSaved={onSaved}
+            onStatusChange={onStatusChange}
+            disabled={!String(form.account_holder_name || '').trim() || !String(form.bank_name || '').trim() || !String(form.bank_account || '').trim() || !String(form.ifsc_code || '').trim() || !String(form.branch_name || '').trim()}
+            validate={() => {
+              if (!String(form.account_holder_name || '').trim()) return 'Enter account holder name';
+              if (!String(form.bank_name || '').trim()) return 'Enter bank name';
+              if (!isValidBankAccount(form.bank_account)) return 'Account number must be 9 to 18 digits';
+              if (!isValidIfscCode(form.ifsc_code)) return 'Enter valid IFSC code';
+              if (!String(form.branch_name || '').trim()) return 'Enter branch name';
+              return '';
+            }}
+            payloadBuilder={() => ({
+              account_holder_name: form.account_holder_name,
+              bank_name: form.bank_name,
+              bank_account: cleanBankAccount(form.bank_account),
+              ifsc_code: cleanIfscCode(form.ifsc_code),
+              branch_name: form.branch_name,
+              upi_id: form.upi_id,
+              bank_qr_url: form.bank_qr_url,
+            })}
+            modified={consultantBankChanged}
+          />
+        </CardContent>
+      </Card>
+
+      <Card className="border-slate-200 shadow-sm overflow-hidden rounded-3xl bg-white">
+        <CardHeader className="bg-sky-50/80 border-b">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <CardTitle className="text-base flex items-center gap-2"><ShieldCheck className="w-5 h-5 text-slate-500" /> Consultant verification</CardTitle>
+              <CardDescription>Submit PAN and Aadhaar documents for Admin approval.</CardDescription>
+            </div>
+            {documentsStatus === 'verified' && !consultantDocumentsChanged ? (
+              <Badge className="border border-emerald-200 bg-emerald-50 text-emerald-700 shadow-sm"><CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Done</Badge>
+            ) : documentsStatus === 'pending' && !consultantDocumentsChanged ? (
+              <Badge className="bg-amber-100 text-amber-700">Pending Approval</Badge>
+            ) : (
+              <Badge className="border border-rose-200 bg-rose-50 text-rose-700 shadow-sm"><ShieldCheck className="w-3.5 h-3.5 mr-1" /> Send for Verification</Badge>
+            )}
+          </div>
+        </CardHeader>
+        <CardContent className="p-4 sm:p-5 space-y-5 bg-slate-50/40">
+          <div className="grid sm:grid-cols-2 gap-3">
+            <div>
+              <Label>PAN number<span className="text-red-500 ml-0.5">*</span></Label>
+              <Input value={form.pan_number || ''} maxLength={10} onChange={(e) => setForm((f) => ({ ...f, pan_number: cleanPan(e.target.value) }))} placeholder="ABCDE1234F" />
+            </div>
+            <div>
+              <Label>Aadhaar number<span className="text-red-500 ml-0.5">*</span></Label>
+              <Input value={form.aadhaar_number || ''} maxLength={12} inputMode="numeric" onChange={(e) => setForm((f) => ({ ...f, aadhaar_number: cleanAadhaar(e.target.value) }))} placeholder="123412341234" />
+            </div>
+          </div>
+          <div className="grid md:grid-cols-3 gap-3">
+            <DocumentUploadBox color="indigo" label="PAN front" url={form.pan_image_url} verified={documentsStatus === 'verified' && !consultantDocumentsChanged} disabled={busy} onFile={(file) => uploadField('pan_image_url', 'consultant-pan-front', file)} />
+            <DocumentUploadBox color="indigo" label="Aadhaar front" url={form.aadhaar_front_url} verified={documentsStatus === 'verified' && !consultantDocumentsChanged} disabled={busy} onFile={(file) => uploadField('aadhaar_front_url', 'consultant-aadhaar-front', file)} />
+            <DocumentUploadBox color="indigo" label="Aadhaar back" url={form.aadhaar_back_url} verified={documentsStatus === 'verified' && !consultantDocumentsChanged} disabled={busy} onFile={(file) => uploadField('aadhaar_back_url', 'consultant-aadhaar-back', file)} />
+          </div>
+          <SectionVerificationAction
+            token={token}
+            me={me}
+            section="documents"
+            title="Admin approval required"
+            description="Admin checks your PAN and Aadhaar documents and marks this card approved."
+            color="indigo"
+            setForm={setForm}
+            onSaved={onSaved}
+            onStatusChange={onStatusChange}
+            disabled={!form.pan_image_url || !form.aadhaar_front_url || !form.aadhaar_back_url || !validPan(form.pan_number) || !validAadhaar(form.aadhaar_number)}
+            validate={() => {
+              if (!validPan(form.pan_number)) return 'Enter valid PAN format, e.g. ABCDE1234F';
+              if (!validAadhaar(form.aadhaar_number)) return 'Aadhaar must be exactly 12 digits';
+              if (!form.pan_image_url || !form.aadhaar_front_url || !form.aadhaar_back_url) return 'Upload PAN front and Aadhaar front/back';
+              return '';
+            }}
+            payloadBuilder={() => ({
+              pan_number: cleanPan(form.pan_number),
+              pan_image_url: form.pan_image_url,
+              aadhaar_number: cleanAadhaar(form.aadhaar_number),
+              aadhaar_front_url: form.aadhaar_front_url,
+              aadhaar_back_url: form.aadhaar_back_url,
+            })}
+            modified={consultantDocumentsChanged}
+          />
+        </CardContent>
+      </Card>
+
+      <Card className={`border ${consultant.verified ? 'border-emerald-200 bg-emerald-50' : allSectionsVerified ? 'border-amber-200 bg-amber-50' : 'border-slate-200 bg-white'} shadow-sm`}>
+        <CardContent className="p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <p className="font-bold text-slate-900">{consultant.verified ? 'Account verified' : allSectionsVerified ? 'All sections approved' : 'Complete all verification cards'}</p>
+            <p className="text-sm text-slate-600 mt-1">
+              {consultant.verified
+                ? 'Your Consultant account has completed Admin verification.'
+                : allSectionsVerified
+                  ? 'Admin has approved each card. Final account verification is pending.'
+                  : 'Send Profile, Bank Details and Consultant Verification for Admin review.'}
+            </p>
+          </div>
+          <Badge className={consultant.verified ? 'bg-emerald-600 text-white' : allSectionsVerified ? 'bg-amber-500 text-white' : 'bg-slate-100 text-slate-700'}>
+            {consultant.verified ? 'Verified' : allSectionsVerified ? 'Final verification pending' : 'Verification incomplete'}
+          </Badge>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -1736,6 +2136,8 @@ function AdminApp({ auth, onLogout }) {
   const [adminMessage, setAdminMessage] = useState('');
   const [adminTab, setAdminTab] = useState('users');
   const [approvalConfirm, setApprovalConfirm] = useState(null);
+  const [adminProfileEditing, setAdminProfileEditing] = useState(false);
+  const [adminProfileDraft, setAdminProfileDraft] = useState(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settings, setSettings] = useState({
     maintenance_mode: false,
@@ -1801,11 +2203,14 @@ function AdminApp({ auth, onLogout }) {
   useEffect(() => { loadUsers(); }, [token]);
 
   const openDetails = async (user) => {
-    // Every signed-in account remains visible in the Admin list, but profile,
-    // document and bank details stay private until Send for Verification.
+    // Every signed-in account remains visible in the Admin list. The basic Profile
+    // card is visible before submission; bank and document cards stay hidden until
+    // the complete verification set has been sent for review.
     setSelected(user);
     setMessages([]);
     setAdminMessage('');
+    setAdminProfileEditing(false);
+    setAdminProfileDraft(null);
     if (user?.role !== 'admin' && user?.submitted_for_review === false) {
       setLoadingDetails(false);
       return;
@@ -1828,6 +2233,66 @@ function AdminApp({ auth, onLogout }) {
     }
   };
 
+  const startAdminProfileEdit = () => {
+    if (!selected || !['worker', 'employer'].includes(selected.role)) return;
+    if (selected.role === 'worker') {
+      setAdminProfileDraft({
+        full_name: selected.full_name || '',
+        phone: selected.phone || '',
+        age: selected.age ?? '',
+        gender: selected.gender || '',
+        address: selected.address || '',
+        skills: Array.isArray(selected.skills) ? selected.skills.join(', ') : (selected.skills || ''),
+        experience_value: selected.experience_value ?? selected.experience_years ?? 0,
+        experience_unit: normalizeExperienceUnit(selected.experience_unit),
+        experience_level: selected.experience_level || '',
+        expected_daily_wage: selected.expected_daily_wage ?? '',
+        languages_known: Array.isArray(selected.languages_known) ? selected.languages_known.join(', ') : (selected.languages_known || ''),
+        available: selected.available !== false,
+        previous_employer_reference: selected.previous_employer_reference || '',
+        bio: selected.bio || '',
+      });
+    } else {
+      setAdminProfileDraft({
+        full_name: selected.full_name || '',
+        phone: selected.phone || '',
+        company_name: selected.company_name || '',
+        industry: selected.industry || '',
+        company_size: selected.company_size || '',
+        hr_contact: selected.hr_contact || '',
+        official_email: selected.official_email || '',
+        company_address: selected.company_address || '',
+        description: selected.description || '',
+      });
+    }
+    setAdminProfileEditing(true);
+  };
+
+  const saveAdminProfileEdit = async () => {
+    if (!selected?.id || !adminProfileDraft || !['worker', 'employer'].includes(selected.role)) return;
+    if (!String(adminProfileDraft.full_name || '').trim() && selected.role === 'worker') return toast.error('Full name is required');
+    if (!String(adminProfileDraft.company_name || '').trim() && selected.role === 'employer') return toast.error('Company name is required');
+    setBusy(true);
+    try {
+      const result = await api(`admin/users/${selected.id}/profile`, {
+        method: 'PATCH',
+        token,
+        body: adminProfileDraft,
+      });
+      if (result?.user) {
+        setSelected((current) => current?.id === selected.id ? ({ ...current, ...result.user }) : current);
+        setUsers((current) => current.map((user) => user.id === selected.id ? ({ ...user, ...result.user }) : user));
+      }
+      setAdminProfileEditing(false);
+      setAdminProfileDraft(null);
+      toast.success('Profile details updated');
+    } catch (e) {
+      toast.error(e.message || 'Unable to update profile details');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const blockUser = async (id, blocked) => {
     setBusy(true);
     try {
@@ -1840,7 +2305,11 @@ function AdminApp({ auth, onLogout }) {
 
   const verifyUser = async (id, verified = true) => {
     if (verified && adminUserRole !== 'admin' && !adminRequiredSectionsDone) {
-      toast.error(adminUserRole === 'worker' ? 'Verify Profile, Bank Details and Verification section first' : 'Verify Profile and Employer Verification section first');
+      toast.error(adminUserRole === 'worker'
+        ? 'Verify Profile, Bank Details and Verification section first'
+        : adminUserRole === 'consultant'
+          ? 'Verify Profile, Bank Details and Consultant Verification section first'
+          : 'Verify Profile and Employer Verification section first');
       return;
     }
     const previousSelected = selected;
@@ -1899,7 +2368,11 @@ function AdminApp({ auth, onLogout }) {
   const requestFinalApproval = () => {
     if (!selected?.id || busy) return;
     if (adminUserRole !== 'admin' && !adminRequiredSectionsDone) {
-      toast.error(adminUserRole === 'worker' ? 'Verify Profile, Bank Details and Verification section first' : 'Verify Profile and Employer Verification section first');
+      toast.error(adminUserRole === 'worker'
+        ? 'Verify Profile, Bank Details and Verification section first'
+        : adminUserRole === 'consultant'
+          ? 'Verify Profile, Bank Details and Consultant Verification section first'
+          : 'Verify Profile and Employer Verification section first');
       return;
     }
     setApprovalConfirm({ type: 'final', label: 'Final account verification', userId: selected.id });
@@ -1969,8 +2442,14 @@ function AdminApp({ auth, onLogout }) {
   };
   const isSectionVerified = (section) => getAdminSectionState(section) === 'verified';
   const adminUserRole = (selected?.role || '').toLowerCase();
-  const selectedDetailsLocked = !!selected && !['admin', 'consultant'].includes(adminUserRole) && selected?.submitted_for_review === false;
-  const adminRequiredSections = adminUserRole === 'worker' ? ['profile', 'bank', 'verification'] : adminUserRole === 'employer' ? ['profile', 'verification'] : [];
+  const selectedDetailsLocked = !!selected && adminUserRole !== 'admin' && selected?.submitted_for_review === false;
+  const adminRequiredSections = adminUserRole === 'worker'
+    ? ['profile', 'bank', 'verification']
+    : adminUserRole === 'employer'
+      ? ['profile', 'verification']
+      : adminUserRole === 'consultant'
+        ? ['profile', 'bank', 'verification']
+        : [];
   const adminRequiredSectionsDone = adminRequiredSections.length === 0 || adminRequiredSections.every(isSectionVerified);
 
   const verifySection = async (section) => {
@@ -2119,7 +2598,7 @@ function AdminApp({ auth, onLogout }) {
             ['Total users', adminStats.total, 'text-slate-900'],
             ['Workers', adminStats.workers, 'text-blue-700'],
             ['Employers', adminStats.employers, 'text-emerald-700'],
-            ['Consultants', adminStats.consultants, 'text-violet-700'],
+            ['Consultants', adminStats.consultants, 'text-cyan-700'],
             ['Pending verify', adminStats.pending, 'text-amber-600'],
             ['Verified', adminStats.verified, 'text-emerald-600'],
             ['Blocked', adminStats.blocked, 'text-red-600'],
@@ -2234,7 +2713,7 @@ function AdminApp({ auth, onLogout }) {
                     <tr key={u.id} className="border-t border-slate-100 align-top transition-colors hover:bg-blue-50/70">
                       <td className="p-3 align-middle overflow-hidden">
                         <div className="flex items-center gap-3 min-w-0 w-full sm:w-auto">
-                          <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-violet-100 text-violet-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>
+                          <div className={`h-10 w-10 shrink-0 rounded-xl grid place-items-center text-sm font-extrabold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-fuchsia-100 text-fuchsia-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>
                             {String(u.full_name || u.company_name || u.email || 'U').trim().charAt(0).toUpperCase()}
                           </div>
                           <div className="min-w-0">
@@ -2245,7 +2724,7 @@ function AdminApp({ auth, onLogout }) {
                         </div>
                       </td>
                       <td className="p-3 align-middle capitalize whitespace-nowrap">
-                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-violet-100 text-violet-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>{u.role}</span>
+                        <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-bold ${u.role === 'employer' ? 'bg-emerald-100 text-emerald-700' : u.role === 'consultant' ? 'bg-fuchsia-100 text-fuchsia-700' : u.role === 'admin' ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-700'}`}>{u.role}</span>
                       </td>
                       <td className="p-3 align-middle whitespace-nowrap">{u.login_id || '—'}</td>
                       <td className="p-3 align-middle">
@@ -2275,7 +2754,8 @@ function AdminApp({ auth, onLogout }) {
                       </td>
                       <td className="p-3 align-middle space-y-1 whitespace-nowrap">
                         {u.blocked ? <Badge className="bg-red-100 text-red-700">Blocked</Badge> : <Badge className="bg-emerald-100 text-emerald-700">Active</Badge>}
-                        {u.role === 'consultant' ? <Badge className="bg-violet-100 text-violet-700 border border-violet-200 block w-fit">Referral active</Badge> : u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Unverified'}</Badge>}
+                        {u.verified ? <Badge className="bg-emerald-100 text-emerald-700 block w-fit">Verified</Badge> : <Badge variant="outline" className="block w-fit">{u.verification_status || 'Not submitted'}</Badge>}
+                        {u.role === 'consultant' && <Badge className="bg-fuchsia-100 text-fuchsia-700 border border-fuchsia-200 block w-fit">Referral active</Badge>}
                         {(() => {
                           try {
                             const submittedAt = u.verification_submitted_at ? new Date(u.verification_submitted_at) : null;
@@ -2311,17 +2791,118 @@ function AdminApp({ auth, onLogout }) {
           </DialogHeader>
           {selected && (
             selectedDetailsLocked ? (
-              <div className="min-h-[360px] flex items-center justify-center p-6">
-                <div className="w-full max-w-lg rounded-3xl border border-slate-200 bg-white p-8 text-center shadow-sm">
-                  <div className="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-3xl bg-slate-100 text-slate-500">
-                    <ShieldAlert className="h-8 w-8" />
+              <div className="space-y-5">
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                  <div className="flex items-start gap-3">
+                    <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0" />
+                    <div>
+                      <p className="font-bold">Verification details not submitted yet</p>
+                      <p className="mt-1">Basic Profile details are visible to Admin now. Bank details and verification documents will appear only after the user completes Send for Verification.</p>
+                    </div>
                   </div>
-                  <h3 className="text-xl font-extrabold text-slate-950">Verification details not submitted yet</h3>
-                  <p className="mt-2 text-sm leading-relaxed text-slate-600">
-                    This account is visible in the Admin user list, but its profile, bank and document details will appear here only after the user clicks Send for Verification.
-                  </p>
-                  <Badge variant="outline" className="mt-4 border-slate-200 bg-slate-50 text-slate-600">Waiting for user submission</Badge>
                 </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <InfoTile label="Email" value={selected.email} />
+                  <InfoTile label="Role" value={selected.role} />
+                  <InfoTile label="Login ID" value={selected.login_id} />
+                  <InfoTile label="Phone" value={selected.phone} />
+                  <InfoTile label={adminUserRole === 'consultant' ? 'Referral code' : 'Location'} value={adminUserRole === 'consultant' ? selected.referral_code : selected.location_text} />
+                  <InfoTile label="Account status" value="Not submitted" />
+                </div>
+
+                <AdminVerificationSection
+                  title="Profile"
+                  tone="indigo"
+                  icon={<UserCircle className="w-4 h-4" />}
+                  status={getAdminSectionState('profile')}
+                  verified={isSectionVerified('profile')}
+                  onVerify={() => requestSectionApproval('profile', 'Profile')}
+                  onUnapprove={() => requestSectionUnapproval('profile', 'Profile')}
+                  disabled={true}
+                  extraAction={['worker', 'employer'].includes(selected.role) ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={busy || adminProfileEditing}
+                      onClick={(event) => { event.preventDefault(); event.stopPropagation(); startAdminProfileEdit(); }}
+                      className="h-10 rounded-xl border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50"
+                    >
+                      <Edit3 className="w-4 h-4 mr-1.5" />Edit
+                    </Button>
+                  ) : null}
+                >
+                  {adminProfileEditing ? (
+                    <AdminProfileEditor
+                      role={selected.role}
+                      draft={adminProfileDraft}
+                      setDraft={setAdminProfileDraft}
+                      busy={busy}
+                      onSave={saveAdminProfileEdit}
+                      onCancel={() => { setAdminProfileEditing(false); setAdminProfileDraft(null); }}
+                    />
+                  ) : selected.role === 'worker' ? (
+                    <div className="grid gap-3">
+                      <div className="grid sm:grid-cols-2 gap-3">
+                        <InfoTile label="Full name" value={selected.full_name} />
+                        <InfoTile label="Login email" value={selected.email} />
+                        <InfoTile label="Phone" value={selected.phone} />
+                        <InfoTile label="Login ID" value={selected.login_id} />
+                        <InfoTile label="Age" value={selected.age} />
+                        <InfoTile label="Gender" value={selected.gender} />
+                        <InfoTile label="Address" value={selected.address} />
+                        <InfoTile label="Saved work location" value={selected.location_text || selected.place_name} />
+                        <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
+                        <InfoTile label="Skills" value={Array.isArray(selected.skills) ? selected.skills.join(', ') : selected.skills} />
+                        <InfoTile label="Experience" value={formatWorkerExperience(selected)} />
+                        <InfoTile label="Experience level" value={selected.experience_level} />
+                        <InfoTile label="Expected daily wage" value={selected.expected_daily_wage ? `₹${selected.expected_daily_wage}` : '—'} />
+                        <InfoTile label="Languages known" value={Array.isArray(selected.languages_known) ? selected.languages_known.join(', ') : selected.languages_known} />
+                        <InfoTile label="Availability" value={selected.available === false ? 'Not available' : 'Available'} />
+                        <InfoTile label="Previous employer reference" value={selected.previous_employer_reference} />
+                      </div>
+                      <InfoTile label="Bio / about worker" value={selected.bio} />
+                      <div className="grid sm:grid-cols-2 gap-3">
+                        <AdminDocPreview title="Profile photo" url={selected.photo_url || selected.profile_photo_url || selected.profile_image_url} />
+                        <AdminDocPreview title="Resume" url={selected.resume_url} />
+                      </div>
+                    </div>
+                  ) : selected.role === 'employer' ? (
+                    <div className="grid gap-3">
+                      <div className="grid sm:grid-cols-2 gap-3">
+                        <InfoTile label="Contact person" value={selected.full_name} />
+                        <InfoTile label="Login email" value={selected.email} />
+                        <InfoTile label="Phone" value={selected.phone} />
+                        <InfoTile label="Login ID" value={selected.login_id} />
+                        <InfoTile label="Company" value={selected.company_name} />
+                        <InfoTile label="Industry" value={selected.industry} />
+                        <InfoTile label="Company size" value={selected.company_size} />
+                        <InfoTile label="Official email" value={selected.official_email} />
+                        <InfoTile label="HR contact" value={selected.hr_contact} />
+                        <InfoTile label="Company address" value={selected.company_address} />
+                        <InfoTile label="Saved company location" value={selected.location_text || selected.place_name} />
+                        <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
+                      </div>
+                      <InfoTile label="About company" value={selected.description} />
+                      <AdminDocPreview title="Company logo" url={selected.company_logo} />
+                    </div>
+                  ) : (
+                    <div className="grid sm:grid-cols-2 gap-3">
+                      <InfoTile label="Full name" value={selected.full_name} />
+                      <InfoTile label="Login email" value={selected.email} />
+                      <InfoTile label="Phone" value={selected.phone} />
+                      <InfoTile label="Login ID" value={selected.login_id} />
+                      <div className="sm:col-span-2"><InfoTile label="Address" value={selected.address} /></div>
+                    </div>
+                  )}
+                </AdminVerificationSection>
+
+                {adminUserRole === 'consultant' && (
+                  <div className="rounded-2xl border border-fuchsia-200 bg-fuchsia-50/60 p-4 text-sm text-fuchsia-800">
+                    Consultant referral code: <b>{selected.referral_code || '—'}</b>. Referral dashboard data remains available after the verification set is submitted.
+                  </div>
+                )}
               </div>
             ) : (
             <div className="space-y-5">
@@ -2336,16 +2917,18 @@ function AdminApp({ auth, onLogout }) {
                 <InfoTile label="Login ID" value={selected.login_id} />
                 <InfoTile label="Phone" value={selected.phone} />
                 <InfoTile label={adminUserRole === 'consultant' ? 'Referral code' : 'Location'} value={adminUserRole === 'consultant' ? selected.referral_code : selected.location_text} />
-                <InfoTile label="Account status" value={adminUserRole === 'consultant' ? 'Consultant active' : selected.verified ? 'Verified account' : (selected.verification_status || 'Not submitted')} />
+                <InfoTile label="Account status" value={selected.verified ? 'Verified account' : (selected.verification_status || 'Not submitted')} />
                 <InfoTile label="Created" value={selected.created_at ? new Date(selected.created_at).toLocaleString() : '—'} />
                 <InfoTile label="Last updated" value={selected.updated_at ? new Date(selected.updated_at).toLocaleString() : '—'} />
               </div>
 
-              {adminUserRole === 'consultant' ? (
-                <ConsultantAdminSummary selected={selected} />
-              ) : (() => {
+              {(() => {
                 const canFinalVerify = adminRequiredSectionsDone;
-                const verificationTitle = selected.role === 'worker' ? 'Worker Verification' : 'Employer Verification';
+                const verificationTitle = selected.role === 'worker'
+                  ? 'Worker Verification'
+                  : selected.role === 'consultant'
+                    ? 'Consultant Verification'
+                    : 'Employer Verification';
                 return (
                   <div className="grid lg:grid-cols-2 gap-4">
                     <AdminVerificationSection
@@ -2356,9 +2939,30 @@ function AdminApp({ auth, onLogout }) {
                       verified={isSectionVerified('profile')}
                       onVerify={() => requestSectionApproval('profile', 'Profile')}
                       onUnapprove={() => requestSectionUnapproval('profile', 'Profile')}
-                      disabled={busy || selected.role === 'admin'}
+                      disabled={busy || selected.role === 'admin' || adminProfileEditing}
+                      extraAction={['worker', 'employer'].includes(selected.role) ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={busy || adminProfileEditing}
+                          onClick={(event) => { event.preventDefault(); event.stopPropagation(); startAdminProfileEdit(); }}
+                          className="h-10 rounded-xl border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50"
+                        >
+                          <Edit3 className="w-4 h-4 mr-1.5" />Edit
+                        </Button>
+                      ) : null}
                     >
-                      {selected.role === 'worker' ? (
+                      {adminProfileEditing ? (
+                        <AdminProfileEditor
+                          role={selected.role}
+                          draft={adminProfileDraft}
+                          setDraft={setAdminProfileDraft}
+                          busy={busy}
+                          onSave={saveAdminProfileEdit}
+                          onCancel={() => { setAdminProfileEditing(false); setAdminProfileDraft(null); }}
+                        />
+                      ) : selected.role === 'worker' ? (
                         <div className="grid gap-3">
                           <div className="grid sm:grid-cols-2 gap-3">
                             <InfoTile label="Full name" value={selected.full_name} />
@@ -2384,20 +2988,40 @@ function AdminApp({ auth, onLogout }) {
                             <AdminDocPreview title="Resume" url={selected.resume_url} />
                           </div>
                         </div>
+                      ) : selected.role === 'employer' ? (
+                        <div className="grid gap-3">
+                          <div className="grid sm:grid-cols-2 gap-3">
+                            <InfoTile label="Contact person" value={selected.full_name} />
+                            <InfoTile label="Login email" value={selected.email} />
+                            <InfoTile label="Phone" value={selected.phone} />
+                            <InfoTile label="Login ID" value={selected.login_id} />
+                            <InfoTile label="Company" value={selected.company_name} />
+                            <InfoTile label="Industry" value={selected.industry} />
+                            <InfoTile label="Company size" value={selected.company_size} />
+                            <InfoTile label="Official email" value={selected.official_email} />
+                            <InfoTile label="HR contact" value={selected.hr_contact} />
+                            <InfoTile label="Company address" value={selected.company_address} />
+                            <InfoTile label="Saved company location" value={selected.location_text || selected.place_name} />
+                            <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
+                          </div>
+                          <InfoTile label="About company" value={selected.description} />
+                          <AdminDocPreview title="Company logo" url={selected.company_logo} />
+                        </div>
                       ) : (
-                        <>
-                          <InfoTile label="Name" value={selected.full_name || selected.company_name} />
-                          <InfoTile label="Phone" value={selected.phone} />
-                          <InfoTile label="Address" value={selected.company_address} />
-                          <InfoTile label="Coordinates" value={selected.latitude && selected.longitude ? formatCoordinates(selected.latitude, selected.longitude) : '—'} />
-                          <InfoTile label="Company" value={selected.company_name} />
-                          <InfoTile label="Industry" value={selected.industry} />
-                          <InfoTile label="HR contact" value={selected.hr_contact || selected.official_email} />
-                        </>
+                        <div className="grid gap-3">
+                          <div className="grid sm:grid-cols-2 gap-3">
+                            <InfoTile label="Full name" value={selected.full_name} />
+                            <InfoTile label="Login email" value={selected.email} />
+                            <InfoTile label="Phone" value={selected.phone} />
+                            <InfoTile label="Login ID" value={selected.login_id} />
+                            <div className="sm:col-span-2"><InfoTile label="Address" value={selected.address} /></div>
+                          </div>
+                          <AdminDocPreview title="Profile photo" url={selected.photo_url} />
+                        </div>
                       )}
                     </AdminVerificationSection>
 
-                    {adminUserRole === 'worker' && (
+                    {['worker', 'consultant'].includes(adminUserRole) && (
                       <AdminVerificationSection
                         title="Bank Details"
                         tone="emerald"
@@ -2418,7 +3042,7 @@ function AdminApp({ auth, onLogout }) {
                       </AdminVerificationSection>
                     )}
 
-                    <div className={adminUserRole === 'worker' ? 'lg:col-span-2' : ''}>
+                    <div className={['worker', 'consultant'].includes(adminUserRole) ? 'lg:col-span-2' : ''}>
                       <AdminVerificationSection
                       title={verificationTitle}
                       tone="amber"
@@ -2429,15 +3053,16 @@ function AdminApp({ auth, onLogout }) {
                       onUnapprove={() => requestSectionUnapproval('verification', verificationTitle)}
                       disabled={busy || selected.role === 'admin'}
                     >
-                      {selected.role === 'worker' && <InfoTile label="Aadhaar" value={selected.aadhaar_number} />}
+                      {['worker', 'consultant'].includes(selected.role) && <InfoTile label="Aadhaar" value={selected.aadhaar_number} />}
+                      {selected.role === 'consultant' && <InfoTile label="PAN" value={selected.pan_number} />}
                       {selected.role === 'employer' && <InfoTile label="GST" value={selected.gst_number} />}
                       <div className="grid sm:grid-cols-2 gap-3">
-                        {selected.role === 'worker' && <AdminDocPreview title="Aadhaar front" url={selected.aadhaar_front_url} />}
-                        {selected.role === 'worker' && <AdminDocPreview title="Aadhaar back" url={selected.aadhaar_back_url} />}
+                        {['worker', 'consultant'].includes(selected.role) && <AdminDocPreview title="Aadhaar front" url={selected.aadhaar_front_url} />}
+                        {['worker', 'consultant'].includes(selected.role) && <AdminDocPreview title="Aadhaar back" url={selected.aadhaar_back_url} />}
                         <AdminDocPreview title={selected.role === 'employer' ? 'Company PAN front' : 'PAN front'} url={selected.pan_image_url} />
                         {selected.role === 'worker' && <AdminDocPreview title="PAN back" url={selected.pan_back_url} />}
                         {selected.role === 'employer' && <AdminDocPreview title="GST certificate" url={selected.gst_certificate_url} />}
-                        <AdminDocPreview title={selected.role === 'employer' ? 'Employer selfie' : 'Selfie'} url={selected.selfie_url || selected.selfie_front_url} />
+                        {['worker', 'employer'].includes(selected.role) && <AdminDocPreview title={selected.role === 'employer' ? 'Employer selfie' : 'Selfie'} url={selected.selfie_url || selected.selfie_front_url} />}
                         {selected.role === 'worker' && <AdminDocPreview title="Skill certificate" url={selected.certificate_url} />}
                       </div>
                       {adminUserRole === 'worker' && (
@@ -2455,6 +3080,8 @@ function AdminApp({ auth, onLogout }) {
                 );
               })()}
 
+              {adminUserRole === 'consultant' && <ConsultantAdminSummary selected={selected} />}
+
               {(() => {
                 try {
                   const submittedAt = selected.verification_submitted_at ? new Date(selected.verification_submitted_at) : null;
@@ -2464,7 +3091,11 @@ function AdminApp({ auth, onLogout }) {
                     const updatedSection = normalizeVerificationSection(
                       selected.verification_section || selected.pending_verification_section || selected.extra?.verification_section || selected.extra?.pending_verification_section || 'profile'
                     );
-                    const updatedLabel = updatedSection === 'bank' ? 'Bank Details' : updatedSection === 'documents' ? (selected.role === 'worker' ? 'Worker Verification' : 'Employer Verification') : 'Profile';
+                    const updatedLabel = updatedSection === 'bank'
+                      ? 'Bank Details'
+                      : updatedSection === 'documents'
+                        ? (selected.role === 'worker' ? 'Worker Verification' : selected.role === 'consultant' ? 'Consultant Verification' : 'Employer Verification')
+                        : 'Profile';
                     return <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><Badge className="bg-amber-100 text-amber-800 mr-2">Updated</Badge>{updatedLabel} was updated. Review only that card; previously approved cards remain approved.</div>;
                   }
                 } catch (e) {}
@@ -2481,7 +3112,7 @@ function AdminApp({ auth, onLogout }) {
               </motion.div>
 
               <div className="flex flex-wrap gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                {adminUserRole !== 'consultant' && (
+                {adminUserRole !== 'admin' && (
                   <Button
                     type="button"
                     disabled={busy || adminUserRole === 'admin' || !!selected.verified || !adminRequiredSectionsDone}
@@ -2493,7 +3124,7 @@ function AdminApp({ auth, onLogout }) {
                     <span className="whitespace-nowrap">{selected.verified ? 'Account verified' : 'Final verify account'}</span>
                   </Button>
                 )}
-                {adminUserRole !== 'consultant' && <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>}
+                {adminUserRole !== 'admin' && <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => verifyUser(selected.id, false)}><XCircle className="w-4 h-4 mr-2" /> Reject verification</Button>}
                 <Button type="button" disabled={busy || selected.role === 'admin'} variant="outline" className="whitespace-nowrap" onClick={() => blockUser(selected.id, !selected.blocked)}>{selected.blocked ? 'Unblock user' : 'Block user'}</Button>
                 <Button type="button" disabled={busy || selected.role === 'admin'} variant="destructive" className="whitespace-nowrap" onClick={() => deleteUser(selected.id, selected.email)}>Delete user</Button>
               </div>
@@ -2590,7 +3221,7 @@ function AdminApp({ auth, onLogout }) {
   );
 }
 
-function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_submitted', verified, children, onVerify, onUnapprove, disabled }) {
+function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_submitted', verified, children, onVerify, onUnapprove, disabled, extraAction = null }) {
   const normalizedStatus = verified ? 'verified' : normalizeVerifyStatusValue(status) || 'not_submitted';
   const palette = {
     indigo: { shell: 'border-indigo-200/80 bg-gradient-to-br from-white via-indigo-50/50 to-blue-50/70', icon: 'bg-indigo-600', ring: 'shadow-indigo-100' },
@@ -2617,6 +3248,7 @@ function AdminVerificationSection({ title, tone = 'indigo', icon, status = 'not_
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {extraAction}
           <Button
             type="button"
             size="sm"
@@ -2656,6 +3288,83 @@ function InfoTile({ label, value }) {
   );
 }
 
+
+function AdminProfileEditor({ role, draft, setDraft, busy, onSave, onCancel }) {
+  if (!draft) return null;
+  const update = (key, value) => setDraft((current) => ({ ...(current || {}), [key]: value }));
+
+  return (
+    <div className="rounded-2xl border border-indigo-200 bg-white p-4 shadow-sm space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="font-black text-slate-950">Edit profile details</p>
+          <p className="text-xs text-slate-500">Admin changes are saved to the same profile used in the user dashboard.</p>
+        </div>
+        <Badge className="bg-indigo-100 text-indigo-700 border border-indigo-200">Admin edit</Badge>
+      </div>
+
+      {role === 'worker' ? (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div><Label>Full name</Label><Input value={draft.full_name || ''} onChange={(e) => update('full_name', e.target.value)} /></div>
+          <div><Label>Phone</Label><Input inputMode="tel" value={draft.phone || ''} onChange={(e) => update('phone', e.target.value)} /></div>
+          <div><Label>Age</Label><Input type="number" min="18" value={draft.age ?? ''} onChange={(e) => update('age', e.target.value)} /></div>
+          <div>
+            <Label>Gender</Label>
+            <Select value={draft.gender || ''} onValueChange={(value) => update('gender', value)}>
+              <SelectTrigger><SelectValue placeholder="Select gender" /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Male">Male</SelectItem>
+                <SelectItem value="Female">Female</SelectItem>
+                <SelectItem value="Other">Other</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="sm:col-span-2"><Label>Address</Label><Textarea rows={2} value={draft.address || ''} onChange={(e) => update('address', e.target.value)} /></div>
+          <div className="sm:col-span-2"><Label>Skills</Label><Input value={draft.skills || ''} onChange={(e) => update('skills', e.target.value)} placeholder="Welder, Fitter, Fabricator" /></div>
+          <div>
+            <Label>Experience</Label>
+            <div className="grid grid-cols-[1fr_120px] gap-2">
+              <Input type="number" min="0" step="1" value={draft.experience_value ?? ''} onChange={(e) => update('experience_value', e.target.value)} />
+              <Select value={draft.experience_unit || 'years'} onValueChange={(value) => update('experience_unit', value)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent><SelectItem value="years">Years</SelectItem><SelectItem value="months">Months</SelectItem></SelectContent>
+              </Select>
+            </div>
+          </div>
+          <div><Label>Experience level</Label><Input value={draft.experience_level || ''} onChange={(e) => update('experience_level', e.target.value)} /></div>
+          <div><Label>Expected daily wage</Label><Input type="number" min="0" value={draft.expected_daily_wage ?? ''} onChange={(e) => update('expected_daily_wage', e.target.value)} /></div>
+          <div><Label>Languages known</Label><Input value={draft.languages_known || ''} onChange={(e) => update('languages_known', e.target.value)} placeholder="Tamil, English, Hindi" /></div>
+          <div className="sm:col-span-2"><Label>Previous employer reference</Label><Input value={draft.previous_employer_reference || ''} onChange={(e) => update('previous_employer_reference', e.target.value)} /></div>
+          <div className="sm:col-span-2"><Label>Bio / about worker</Label><Textarea rows={3} value={draft.bio || ''} onChange={(e) => update('bio', e.target.value)} /></div>
+          <label className="sm:col-span-2 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+            <span className="text-sm font-semibold text-slate-800">Available for work</span>
+            <input type="checkbox" checked={draft.available !== false} onChange={(e) => update('available', e.target.checked)} className="h-4 w-4 accent-indigo-600" />
+          </label>
+        </div>
+      ) : (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div><Label>Contact person name</Label><Input value={draft.full_name || ''} onChange={(e) => update('full_name', e.target.value)} /></div>
+          <div><Label>Phone</Label><Input inputMode="tel" value={draft.phone || ''} onChange={(e) => update('phone', e.target.value)} /></div>
+          <div><Label>Company name</Label><Input value={draft.company_name || ''} onChange={(e) => update('company_name', e.target.value)} /></div>
+          <div><Label>Industry</Label><Input value={draft.industry || ''} onChange={(e) => update('industry', e.target.value)} /></div>
+          <div><Label>Company size</Label><Input value={draft.company_size || ''} onChange={(e) => update('company_size', e.target.value)} /></div>
+          <div><Label>Official email</Label><Input type="email" value={draft.official_email || ''} onChange={(e) => update('official_email', e.target.value)} /></div>
+          <div className="sm:col-span-2"><Label>HR contact</Label><Input value={draft.hr_contact || ''} onChange={(e) => update('hr_contact', e.target.value)} placeholder="Name (Mobile Number)" /></div>
+          <div className="sm:col-span-2"><Label>Company address</Label><Textarea rows={2} value={draft.company_address || ''} onChange={(e) => update('company_address', e.target.value)} /></div>
+          <div className="sm:col-span-2"><Label>About company</Label><Textarea rows={3} value={draft.description || ''} onChange={(e) => update('description', e.target.value)} /></div>
+        </div>
+      )}
+
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>Cancel</Button>
+        <Button type="button" disabled={busy} onClick={onSave} className="bg-indigo-600 hover:bg-indigo-700 text-white">
+          {busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}Save changes
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function AdminCompactList({ title, icon, rows = [], empty = 'No records.' }) {
   return (
     <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-xl shadow-slate-950/5">
@@ -2683,33 +3392,33 @@ function ConsultantAdminSummary({ selected }) {
 
   return (
     <div className="space-y-4">
-      <div className="grid lg:grid-cols-2 gap-4">
-        <Card className="border-violet-200 bg-white shadow-sm">
-          <CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><UserCircle className="w-4 h-4 text-violet-700" />Consultant details</CardTitle></CardHeader>
+      <div className="grid lg:grid-cols-[1.2fr_1fr] gap-4">
+        <Card className="border-fuchsia-200 bg-white shadow-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2"><Award className="w-4 h-4 text-fuchsia-700" />Consultant referral account</CardTitle>
+            <CardDescription>Referral identity and performance stay separate from the verification cards above.</CardDescription>
+          </CardHeader>
           <CardContent className="grid sm:grid-cols-2 gap-3">
-            <InfoTile label="Full name" value={selected?.full_name} />
-            <InfoTile label="Email" value={selected?.email} />
-            <InfoTile label="Mobile number" value={selected?.phone} />
-            <InfoTile label="Login ID" value={selected?.login_id} />
             <InfoTile label="Referral code" value={referralCode} />
-            <InfoTile label="Created" value={selected?.created_at ? new Date(selected.created_at).toLocaleString() : '—'} />
+            <InfoTile label="Points" value={dashboard.points ?? selected?.points ?? 0} />
+            <InfoTile label="People from link" value={dashboard.total_referrals ?? selected?.total_referrals ?? 0} />
+            <InfoTile label="Admin verified referrals" value={dashboard.verified_referrals ?? selected?.verified_referrals ?? 0} />
             <div className="sm:col-span-2"><InfoTile label="Unique referral link" value={referralLink} /></div>
           </CardContent>
         </Card>
 
-        <Card className="border-amber-200 bg-white shadow-sm">
-          <CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><Award className="w-4 h-4 text-amber-700" />Consultant dashboard summary</CardTitle></CardHeader>
-          <CardContent className="grid grid-cols-3 gap-3">
-            <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4"><p className="text-xs text-slate-600">People from link</p><p className="text-2xl font-black text-violet-700 mt-1">{dashboard.total_referrals ?? selected?.total_referrals ?? 0}</p><p className="mt-1 text-[11px] text-slate-500">{dashboard.total_login_events ?? 0} tracked logins</p></div>
-            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4"><p className="text-xs text-slate-600">Admin verified</p><p className="text-2xl font-black text-emerald-700 mt-1">{dashboard.verified_referrals ?? selected?.verified_referrals ?? 0}</p></div>
-            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4"><p className="text-xs text-slate-600">Points</p><p className="text-2xl font-black text-amber-700 mt-1">{dashboard.points ?? selected?.points ?? 0}</p></div>
+        <Card className="border-slate-200 bg-white shadow-sm">
+          <CardHeader className="pb-3"><CardTitle className="text-base flex items-center gap-2"><Users className="w-4 h-4 text-fuchsia-700" />Referral activity</CardTitle></CardHeader>
+          <CardContent className="grid grid-cols-2 gap-3">
+            <div className="rounded-2xl border border-fuchsia-200 bg-fuchsia-50 p-4"><p className="text-xs text-slate-600">Tracked logins</p><p className="text-2xl font-black text-fuchsia-700 mt-1">{dashboard.total_login_events ?? 0}</p></div>
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4"><p className="text-xs text-slate-600">Points earned</p><p className="text-2xl font-black text-amber-700 mt-1">{dashboard.points ?? selected?.points ?? 0}</p></div>
           </CardContent>
         </Card>
       </div>
 
       <Card className="border-slate-200 bg-white shadow-sm">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base flex items-center gap-2"><Users className="w-4 h-4 text-violet-700" />People attributed to this consultant</CardTitle>
+          <CardTitle className="text-base flex items-center gap-2"><Users className="w-4 h-4 text-fuchsia-700" />People attributed to this consultant</CardTitle>
           <CardDescription>Each Admin-verified referral contributes one point.</CardDescription>
         </CardHeader>
         <CardContent>

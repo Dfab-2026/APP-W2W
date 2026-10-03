@@ -1,0 +1,15 @@
+Work2Wish Consultant verification update
+========================================
+
+1. Deploy/use this project version.
+2. Open Supabase Dashboard -> SQL Editor -> New query.
+3. Open CONSULTANT_VERIFICATION_FLOW_UPDATE.sql from this project.
+4. Paste the full SQL and click Run once.
+
+What it does:
+- Adds the Consultant bank/document/verification state columns required by the UI.
+- Allows role='consultant' in the existing durable user_verification_sections table.
+- Creates/backfills Profile, Bank Details, and Consultant Verification card states.
+- It does not alter Worker or Employer verification data.
+
+No new environment variables are required.

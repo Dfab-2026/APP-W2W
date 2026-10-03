@@ -31,10 +31,25 @@ alter table if exists public.employers
   add column if not exists verification_submitted_at timestamptz,
   add column if not exists verified_at timestamptz;
 
+alter table if exists public.consultants
+  add column if not exists verified boolean not null default false,
+  add column if not exists verification_status text not null default 'not_submitted',
+  add column if not exists verification_notes text,
+  add column if not exists section_statuses jsonb not null default '{}'::jsonb,
+  add column if not exists verified_sections jsonb not null default '[]'::jsonb,
+  add column if not exists profile_verified boolean not null default false,
+  add column if not exists bank_verified boolean not null default false,
+  add column if not exists documents_verified boolean not null default false,
+  add column if not exists document_verified boolean not null default false,
+  add column if not exists verification_verified boolean not null default false,
+  add column if not exists verification_section text,
+  add column if not exists verification_submitted_at timestamptz,
+  add column if not exists verified_at timestamptz;
+
 create table if not exists public.user_verification_sections (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
-  role text check (role in ('worker', 'employer', 'admin')),
+  role text check (role in ('worker', 'employer', 'consultant', 'admin')),
   section text not null check (section in ('profile', 'documents', 'bank', 'identity', 'location', 'admin_message')),
   status text not null default 'draft' check (status in ('draft', 'pending', 'verified', 'rejected')),
   submitted_at timestamptz,
@@ -102,6 +117,29 @@ select
   now()
 from public.employers e
 cross join (values ('profile'), ('documents')) as s(section)
+on conflict (user_id, section) do nothing;
+
+-- Backfill consultant states from existing columns/JSON without overwriting rows.
+insert into public.user_verification_sections (user_id, role, section, status, submitted_at, verified_at, updated_at)
+select
+  c.user_id,
+  'consultant',
+  s.section,
+  case
+    when coalesce(c.section_statuses ->> s.section, '') in ('verified','approved','done') then 'verified'
+    when coalesce(c.section_statuses ->> s.section, '') in ('pending','submitted','review','in_review') then 'pending'
+    when s.section = 'profile' and coalesce(c.profile_verified, false) then 'verified'
+    when s.section = 'bank' and coalesce(c.bank_verified, false) then 'verified'
+    when s.section = 'documents' and (coalesce(c.documents_verified, false) or coalesce(c.document_verified, false) or coalesce(c.verification_verified, false)) then 'verified'
+    when c.verification_status in ('pending','submitted') and coalesce(c.verification_section, 'profile') in (s.section, case when s.section='documents' then 'verification' else s.section end) then 'pending'
+    when coalesce(c.verified, false) then 'verified'
+    else 'draft'
+  end,
+  case when c.verification_status in ('pending','submitted') then c.verification_submitted_at else null end,
+  case when coalesce(c.verified, false) then coalesce(c.verified_at, now()) else null end,
+  now()
+from public.consultants c
+cross join (values ('profile'), ('documents'), ('bank')) as s(section)
 on conflict (user_id, section) do nothing;
 
 commit;
